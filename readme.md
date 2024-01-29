@@ -19,10 +19,11 @@ Retired maintainer: [@zerolfx](https://github.com/zerolfx).
 1. Install [Node.js](https://nodejs.org/en/download/) v18+. (You can specify the path to `node` executable by setting `copilot-node-executable`.)
 
 2. Setup `copilot.el` as described in the next section.
+(most up-to-date jsonrpc is also required, it can be installed through elpa)
 
-3. Login to Copilot by `M-x copilot-login`. You can also check the status by `M-x copilot-diagnose` (`NotAuthorized` means you don't have a valid subscription).
+4. Login to Copilot by `M-x copilot-login`. You can also check the status by `M-x copilot-diagnose` (`NotAuthorized` means you don't have a valid subscription).
 
-4. Enjoy!
+5. Enjoy!
 
 ## Configurations
 
