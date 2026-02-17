@@ -244,6 +244,37 @@ To remap the built-in zap commands automatically whenever the overlay is visible
 (keymap-set copilot-completion-map "<remap> <zap-up-to-char>" #'copilot-accept-completion-up-to-char)
 ```
 
+### Company frontend (`copilot-company.el`)
+
+Use `company-copilot` if you want Copilot suggestions in Company's popup UI.
+This is the minimal setup to make it work:
+
+```elisp
+(use-package company
+  :ensure t
+  :hook (prog-mode . company-mode))
+
+(use-package copilot
+  :ensure t
+  :hook (prog-mode . copilot-mode)
+  :config
+  ;; Avoid double UI (Company popup + Copilot inline overlay).
+  (add-to-list 'copilot-disable-display-predicates
+               (lambda () (bound-and-true-p company-mode))))
+
+(use-package copilot-company
+  :after (copilot company)
+  :bind (:map company-mode-map
+              ("C-c C-/" . (lambda ()
+                             (interactive)
+                             (company-begin-backend 'company-copilot)))))
+```
+
+Notes:
+
+- `company-copilot` works only when `copilot-mode` is enabled in the current buffer.
+- Press `C-c C-/` to fetch Copilot candidates, then select in Company with `RET`/`TAB`.
+
 ### LSP settings
 
 You can configure the underlying LSP settings via `copilot-lsp-settings`. The complete list of available options can be found
