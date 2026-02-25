@@ -147,6 +147,14 @@ find indentation offset."
   :type 'boolean
   :package-version '(copilot . "0.1"))
 
+(defcustom copilot-enable-parentheses-balancer t
+  "Whether to post-process completions to balance parentheses in Lisp modes.
+When non-nil, completions in Lisp modes are adjusted to ensure that
+parentheses remain balanced within the surrounding top-level form.
+Set to nil to use completions from the server verbatim."
+  :type 'boolean
+  :group 'copilot)
+
 (defcustom copilot-indentation-alist
   (append '((emacs-lisp-mode lisp-indent-offset)
             (latex-mode tex-indent-basic)
@@ -267,6 +275,50 @@ Incremented after each change.")
 
 (defvar copilot--workspace-folders nil
   "List of workspace folder URIs already reported to the server.")
+
+(defvar copilot--status nil
+  "Current server status from `didChangeStatus' notification.
+Plist with keys :kind, :busy, and :message.")
+
+(defvar copilot--progress-sessions (make-hash-table :test 'equal)
+  "Hash table of active progress sessions, keyed by token.
+Each value is a plist with :title, :message, and :percentage.")
+
+(defun copilot--progress-lighter ()
+  "Compute mode-line progress indicator from active sessions.
+Returns nil when no active sessions.  Otherwise returns a string
+like \"[title: message]\" or \"[title: 42%]\" from the most
+recently updated session."
+  (when (> (hash-table-count copilot--progress-sessions) 0)
+    (let (latest)
+      (maphash (lambda (_k v) (setq latest v)) copilot--progress-sessions)
+      (let ((title (plist-get latest :title))
+            (message (plist-get latest :message))
+            (percentage (plist-get latest :percentage)))
+        (cond
+         (message (format " [%s: %s]" title message))
+         (percentage (format " [%s: %d%%]" title percentage))
+         (t (format " [%s]" title)))))))
+
+(defun copilot--status-lighter ()
+  "Compute the mode-line lighter string from `copilot--status'."
+  (let ((kind (plist-get copilot--status :kind))
+        (busy (plist-get copilot--status :busy))
+        (progress (copilot--progress-lighter)))
+    (concat
+     (cond
+      ((or (null kind) (and (equal kind "Normal") (not busy)))
+       " Copilot")
+      ((and (equal kind "Normal") busy)
+       " Copilot*")
+      ((equal kind "Warning")
+       (propertize " Copilot:Warning" 'face 'warning))
+      ((equal kind "Error")
+       (propertize " Copilot:Error" 'face 'error))
+      ((equal kind "Inactive")
+       (propertize " Copilot:Inactive" 'face 'shadow))
+      (t " Copilot"))
+     progress)))
 
 (defmacro copilot--dbind (pattern source &rest body)
   "Destructure SOURCE against plist PATTERN and eval BODY."
@@ -422,12 +474,14 @@ Incremented after each change.")
   (and copilot--connection
        (zerop (process-exit-status (jsonrpc--process copilot--connection)))))
 
-(defmacro copilot--request (&rest args)
-  "Send a request to the copilot server with ARGS."
+(defmacro copilot--request (method &optional params &rest args)
+  "Send a request to the copilot server for METHOD with PARAMS and ARGS.
+When PARAMS is nil, send an empty JSON object so the server does not
+reject the request with a schema-validation error."
   `(progn
      (unless (copilot--connection-alivep)
        (copilot--start-server))
-     (jsonrpc-request copilot--connection ,@args)))
+     (jsonrpc-request copilot--connection ,method (or ,params (make-hash-table)) ,@args)))
 
 (defmacro copilot--notify (&rest args)
   "Send a notification to the copilot server with ARGS."
@@ -441,20 +495,40 @@ Incremented after each change.")
 
 Arguments METHOD, PARAMS and ARGS are used in function `jsonrpc-async-request'.
 
-SUCCESS-FN is the CALLBACK."
+SUCCESS-FN is the CALLBACK.
+
+Returns the request ID (a number) so callers can cancel the request later."
   `(progn
      (unless (copilot--connection-alivep)
        (copilot--start-server))
      ;; jsonrpc will use temp buffer for callbacks, so we need to save the
      ;; current buffer and restore it inside callback
      (let ((buf (current-buffer)))
-       (jsonrpc-async-request copilot--connection
-                              ,method ,params
-                              :success-fn (lambda (result)
-                                            (if (buffer-live-p buf)
-                                                (with-current-buffer buf
-                                                  (funcall ,success-fn result))))
-                              ,@args))))
+       (car (jsonrpc--async-request-1 copilot--connection
+                                      ,method ,params
+                                      :success-fn (lambda (result)
+                                                    (if (buffer-live-p buf)
+                                                        (with-current-buffer buf
+                                                          (funcall ,success-fn result))))
+                                      ,@args)))))
+
+(defun copilot--shutdown-server ()
+  "Shut down the Copilot server with the standard LSP shutdown sequence.
+Sends a `shutdown' request followed by an `exit' notification, then
+cleans up the connection and resets global state.  Safe to call when
+there is no active connection."
+  (when copilot--connection
+    (condition-case _err
+        (jsonrpc-request copilot--connection 'shutdown nil :timeout 3)
+      (error nil))
+    (condition-case _err
+        (jsonrpc-notify copilot--connection 'exit nil)
+      (error nil))
+    (jsonrpc-shutdown copilot--connection)
+    (setq copilot--connection nil)
+    (setq copilot--opened-buffers nil)
+    (setq copilot--workspace-folders nil)
+    (setq copilot--status nil)))
 
 (defun copilot--command ()
   "Return the command-line to start copilot server."
@@ -532,7 +606,8 @@ You can change the installed version with `M-x copilot-reinstall-server` or remo
           ,@(when copilot-network-proxy
               `(:networkProxy ,copilot-network-proxy))))))
     (copilot--notify 'initialized '())
-    (copilot--notify 'workspace/didChangeConfiguration `(:settings ,(copilot--effective-lsp-settings))))))
+    (copilot--notify 'workspace/didChangeConfiguration `(:settings ,(copilot--effective-lsp-settings)))
+    (add-hook 'kill-emacs-hook #'copilot--shutdown-server))))
 
 ;;
 ;; login / logout
@@ -577,11 +652,7 @@ automatically, browse to %s." user-code verification-uri))
 (defun copilot-diagnose ()
   "Restart and diagnose copilot."
   (interactive)
-  (when copilot--connection
-    (jsonrpc-shutdown copilot--connection 'kill)
-    (setq copilot--connection nil))
-  (setq copilot--opened-buffers nil)
-  (setq copilot--workspace-folders nil)
+  (copilot--shutdown-server)
   ;; We are going to send a test request for the current buffer so we have to activate the mode
   ;; if it is not already activated.
   ;; If it the mode is already active, we have to make sure the current buffer is loaded in the
@@ -660,6 +731,19 @@ automatically, browse to %s." user-code verification-uri))
 
 (defvar-local copilot--completion-cache nil)
 (defvar-local copilot--completion-idx 0)
+
+(defvar-local copilot--completion-request-id nil
+  "Request ID of the in-flight completion request, or nil.")
+
+(defun copilot--cancel-completion ()
+  "Cancel the in-flight completion request, if any.
+Sends `$/cancelRequest' to the server and resets the stored request ID."
+  (when copilot--completion-request-id
+    (when (copilot--connection-alivep)
+      (jsonrpc-notify copilot--connection
+                      '$/cancelRequest
+                      (list :id copilot--completion-request-id)))
+    (setq copilot--completion-request-id nil)))
 
 (defvar-local copilot--indent-warning-printed-p nil
   "Flag indicating whether indent warning was already printed.")
@@ -863,9 +947,11 @@ TRIGGER-KIND is 1 for manual invocation, 2 for automatic."
 (defun copilot--get-completion (callback &optional trigger-kind)
   "Get completion with CALLBACK.
 TRIGGER-KIND is 1 for invoked, 2 for automatic (default)."
-  (copilot--async-request 'textDocument/inlineCompletion
-                          (copilot--inline-completion-params (or trigger-kind 2))
-                          :success-fn callback))
+  (copilot--cancel-completion)
+  (setq copilot--completion-request-id
+        (copilot--async-request 'textDocument/inlineCompletion
+                                (copilot--inline-completion-params (or trigger-kind 2))
+                                :success-fn callback)))
 
 (defun copilot--cycle-completion (direction)
   "Cycle completion with DIRECTION."
@@ -969,6 +1055,72 @@ Each request METHOD can have only one HANDLER."
      (save-excursion
        (goto-char (point-max))
        (insert "End of solutions.\n")))))
+
+(copilot-on-notification
+ 'didChangeStatus
+ (lambda (msg)
+   (copilot--dbind (kind busy message) msg
+     (setq copilot--status (list :kind kind :busy busy :message message))
+     (force-mode-line-update t))))
+
+(copilot-on-request
+ 'window/showMessageRequest
+ (lambda (msg)
+   (copilot--dbind (type message actions) msg
+     (if actions
+         (let* ((titles (mapcar (lambda (a) (plist-get a :title))
+                                (append actions nil)))
+                (chosen (completing-read
+                         (format "Copilot (%s): "
+                                 (pcase type (1 "Error") (2 "Warning")
+                                        (3 "Info") (_ "Log")))
+                         titles nil t)))
+           (list :title chosen))
+       (copilot--log (pcase type (1 'error) (2 'warning) (_ 'info))
+                     "%s" message)
+       :json-null))))
+
+(copilot-on-request
+ 'window/showDocument
+ (lambda (msg)
+   (condition-case _err
+       (copilot--dbind (uri external takeFocus) msg
+         (let ((focus (not (eq takeFocus :json-false))))
+           (cond
+            ((or external (string-match-p "\\`https?://" uri))
+             (browse-url uri))
+            ((string-prefix-p "file://" uri)
+             (let* ((path (url-unhex-string
+                           (string-remove-prefix "file://" uri)))
+                    (buf (find-file-noselect path)))
+               (if focus
+                   (find-file path)
+                 (display-buffer buf)))))
+           (list :success t)))
+     (error (list :success :json-false)))))
+
+(copilot-on-notification
+ '$/progress
+ (lambda (msg)
+   (copilot--dbind (token value) msg
+     (let ((kind (plist-get value :kind)))
+       (cond
+        ((equal kind "begin")
+         (puthash token
+                  (list :title (plist-get value :title)
+                        :message (plist-get value :message)
+                        :percentage (plist-get value :percentage))
+                  copilot--progress-sessions))
+        ((equal kind "report")
+         (let ((session (gethash token copilot--progress-sessions)))
+           (when session
+             (when (plist-member value :message)
+               (plist-put session :message (plist-get value :message)))
+             (when (plist-member value :percentage)
+               (plist-put session :percentage (plist-get value :percentage))))))
+        ((equal kind "end")
+         (remhash token copilot--progress-sessions)))
+       (force-mode-line-update t)))))
 
 (defun copilot--get-panel-completions (callback)
   "Get panel completions with CALLBACK."
@@ -1094,6 +1246,7 @@ already saving an excursion.  This is also a private function."
 (defun copilot-clear-overlay (&optional _is-accepted)
   "Clear Copilot overlay."
   (interactive)
+  (copilot--cancel-completion)
   (when (copilot--overlay-visible)
     (delete-overlay copilot--overlay)
     (delete-overlay copilot--keymap-overlay)
@@ -1139,9 +1292,9 @@ provided."
         (copilot-clear-overlay t)
         (if (derived-mode-p 'vterm-mode)
             (progn
-              (vterm-delete-region start end)
+              (unless is-partial (vterm-delete-region start end))
               (vterm-insert t-completion))
-          (delete-region start end)
+          (unless is-partial (delete-region start end))
           (insert t-completion))
         ;; if it is a partial completion, show remaining text
         (when is-partial
@@ -1243,6 +1396,28 @@ Uppercase CHAR disables `case-fold-search', mirroring `zap-to-char'."
             (pcase-let ((`(,start ,end ,balanced-text) fixed-completion))
               (copilot--display-overlay-completion balanced-text command full-insert-text start end))))))))
 
+(defun copilot--ensure-doc-open ()
+  "Ensure the current buffer has been opened with the Copilot server.
+Sends workspace folder and `textDocument/didOpen' notifications if
+the buffer has not been registered yet.  Safe to call multiple times."
+  (when-let* ((root (copilot--workspace-root))
+              (root-uri (copilot--path-to-uri root)))
+    (unless (member root-uri copilot--workspace-folders)
+      (push root-uri copilot--workspace-folders)
+      (copilot--notify 'workspace/didChangeWorkspaceFolders
+                       (list :event
+                             (list :added (vector (list :uri root-uri
+                                                        :name (file-name-nondirectory
+                                                               (directory-file-name root))))
+                                   :removed [])))))
+  (unless (seq-contains-p copilot--opened-buffers (current-buffer))
+    (add-to-list 'copilot--opened-buffers (current-buffer))
+    (copilot--notify 'textDocument/didOpen
+                     (list :textDocument (list :uri (copilot--get-uri)
+                                               :languageId (copilot--get-language-id)
+                                               :version copilot--doc-version
+                                               :text (copilot--get-source))))))
+
 (defun copilot--on-doc-focus (window)
   "Notify that the document WINDOW has been focussed or opened."
   ;; When switching windows, this function is called twice, once for the
@@ -1250,26 +1425,10 @@ Uppercase CHAR disables `case-fold-search', mirroring `zap-to-char'."
   ;; send a notification for the window gaining focus and only if the buffer has
   ;; copilot-mode enabled.
   (when (and copilot-mode (eq window (selected-window)))
-    ;; Detect new workspace roots and notify the server.
-    (when-let* ((root (copilot--workspace-root))
-                (root-uri (copilot--path-to-uri root)))
-      (unless (member root-uri copilot--workspace-folders)
-        (push root-uri copilot--workspace-folders)
-        (copilot--notify 'workspace/didChangeWorkspaceFolders
-                         (list :event
-                               (list :added (vector (list :uri root-uri
-                                                          :name (file-name-nondirectory
-                                                                 (directory-file-name root))))
-                                     :removed [])))))
     (if (seq-contains-p copilot--opened-buffers (current-buffer))
         (copilot--notify 'textDocument/didFocus
                          (list :textDocument (list :uri (copilot--get-uri))))
-      (add-to-list 'copilot--opened-buffers (current-buffer))
-      (copilot--notify 'textDocument/didOpen
-                       (list :textDocument (list :uri (copilot--get-uri)
-                                                 :languageId (copilot--get-language-id)
-                                                 :version copilot--doc-version
-                                                 :text (copilot--get-source)))))))
+      (copilot--ensure-doc-open))))
 
 (defun copilot--on-doc-close (&rest _args)
   "Notify that the document has been closed."
@@ -1283,6 +1442,7 @@ Uppercase CHAR disables `case-fold-search', mirroring `zap-to-char'."
 (defun copilot-complete ()
   "Complete at the current point."
   (interactive)
+  (copilot--ensure-doc-open)
   (setq copilot--last-doc-version copilot--doc-version)
 
   (setq copilot--completion-cache nil)
@@ -1518,7 +1678,7 @@ Use this for custom bindings in `copilot-mode'.")
 (define-minor-mode copilot-mode
   "Minor mode for Copilot."
   :init-value nil
-  :lighter " Copilot"
+  :lighter (:eval (copilot--status-lighter))
   (copilot-clear-overlay)
   (advice-add 'posn-at-point :before-until #'copilot--posn-advice)
   (if copilot-mode

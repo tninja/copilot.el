@@ -45,6 +45,18 @@
           (invalid-slot-name nil))
         (expect (spy-calls-count 'make-instance) :to-be-greater-than 1))))
 
+  (describe "copilot--request"
+    (it "sends empty object when params is nil"
+      (let ((sent-params nil))
+        (spy-on 'copilot--connection-alivep :and-return-value t)
+        (spy-on 'jsonrpc-request :and-call-fake
+                (lambda (_conn _method params)
+                  (setq sent-params params)
+                  nil))
+        (copilot--request 'signInInitiate nil)
+        ;; params should be a hash table (serializes to {}), not nil
+        (expect (hash-table-p sent-params) :to-be-truthy))))
+
   ;;
   ;; Utility functions
   ;;
@@ -575,32 +587,375 @@
               (kill-buffer))
           (delete-file temp-file)))))
 
+  ;;
+  ;; Status lighter
+  ;;
+
+  (describe "copilot--status-lighter"
+    (it "returns \" Copilot\" when status is nil"
+      (let ((copilot--status nil))
+        (expect (copilot--status-lighter) :to-equal " Copilot")))
+
+    (it "returns \" Copilot\" for Normal and not busy"
+      (let ((copilot--status '(:kind "Normal" :busy nil :message "")))
+        (expect (copilot--status-lighter) :to-equal " Copilot")))
+
+    (it "returns \" Copilot*\" for Normal and busy"
+      (let ((copilot--status '(:kind "Normal" :busy t :message "")))
+        (expect (copilot--status-lighter) :to-equal " Copilot*")))
+
+    (it "returns propertized warning string for Warning kind"
+      (let ((copilot--status '(:kind "Warning" :busy nil :message "some warning")))
+        (let ((result (copilot--status-lighter)))
+          (expect result :to-equal " Copilot:Warning")
+          (expect (get-text-property 0 'face result) :to-equal 'warning))))
+
+    (it "returns propertized error string for Error kind"
+      (let ((copilot--status '(:kind "Error" :busy nil :message "auth failed")))
+        (let ((result (copilot--status-lighter)))
+          (expect result :to-equal " Copilot:Error")
+          (expect (get-text-property 0 'face result) :to-equal 'error))))
+
+    (it "returns propertized inactive string for Inactive kind"
+      (let ((copilot--status '(:kind "Inactive" :busy nil :message "")))
+        (let ((result (copilot--status-lighter)))
+          (expect result :to-equal " Copilot:Inactive")
+          (expect (get-text-property 0 'face result) :to-equal 'shadow)))))
+
+  ;;
+  ;; didChangeStatus notification
+  ;;
+
+  (describe "didChangeStatus handler"
+    (it "sets copilot--status from notification"
+      (let ((copilot--status nil))
+        (spy-on 'force-mode-line-update)
+        ;; Simulate the notification by looking up and calling the handler
+        (let ((handlers (gethash 'didChangeStatus copilot--notification-handlers)))
+          (expect handlers :to-be-truthy)
+          (funcall (car handlers)
+                   '(:kind "Warning" :busy nil :message "something"))
+          (expect (plist-get copilot--status :kind) :to-equal "Warning")
+          (expect (plist-get copilot--status :busy) :to-equal nil)
+          (expect (plist-get copilot--status :message) :to-equal "something")
+          (expect 'force-mode-line-update :to-have-been-called-with t)))))
+
+  ;;
+  ;; window/showMessageRequest handler
+  ;;
+
+  (describe "window/showMessageRequest handler"
+    (it "returns selected action via completing-read"
+      (spy-on 'completing-read :and-return-value "Accept")
+      (let* ((handler (gethash 'window/showMessageRequest
+                                copilot--request-handlers))
+             (result (funcall handler
+                              '(:type 3 :message "Choose"
+                                :actions [(:title "Accept") (:title "Deny")]))))
+        (expect 'completing-read :to-have-been-called)
+        (expect (plist-get result :title) :to-equal "Accept")))
+
+    (it "returns json-null when no actions"
+      (spy-on 'message)
+      (let* ((handler (gethash 'window/showMessageRequest
+                                copilot--request-handlers))
+             (result (funcall handler '(:type 3 :message "Info msg"))))
+        (expect result :to-equal :json-null)
+        (expect 'message :to-have-been-called)))
+
+    (it "logs errors at error level"
+      (spy-on 'message)
+      (let ((handler (gethash 'window/showMessageRequest
+                               copilot--request-handlers)))
+        (funcall handler '(:type 1 :message "Something failed"))
+        (let ((args (spy-calls-args-for 'message 0)))
+          (expect (apply #'format args) :to-match "Something failed"))))
+
+    (it "logs warnings at warning level"
+      (spy-on 'message)
+      (let ((handler (gethash 'window/showMessageRequest
+                               copilot--request-handlers)))
+        (funcall handler '(:type 2 :message "Watch out"))
+        (let ((args (spy-calls-args-for 'message 0)))
+          (expect (apply #'format args) :to-match "Watch out")))))
+
+  ;;
+  ;; window/showDocument handler
+  ;;
+
+  (describe "window/showDocument handler"
+    (it "opens HTTP URIs with browse-url"
+      (spy-on 'browse-url)
+      (let* ((handler (gethash 'window/showDocument
+                                copilot--request-handlers))
+             (result (funcall handler
+                              '(:uri "https://example.com/docs"))))
+        (expect 'browse-url :to-have-been-called-with "https://example.com/docs")
+        (expect (plist-get result :success) :to-equal t)))
+
+    (it "opens file URIs with find-file when takeFocus is true"
+      (let ((temp-file (make-temp-file "copilot-showdoc")))
+        (unwind-protect
+            (progn
+              (spy-on 'find-file)
+              (let* ((handler (gethash 'window/showDocument
+                                        copilot--request-handlers))
+                     (uri (concat "file://" temp-file))
+                     (result (funcall handler
+                                      (list :uri uri :takeFocus t))))
+                (expect 'find-file :to-have-been-called)
+                (expect (plist-get result :success) :to-equal t)))
+          (delete-file temp-file))))
+
+    (it "opens file URIs with display-buffer when takeFocus is false"
+      (let ((temp-file (make-temp-file "copilot-showdoc")))
+        (unwind-protect
+            (progn
+              (spy-on 'find-file-noselect :and-return-value (current-buffer))
+              (spy-on 'display-buffer)
+              (let* ((handler (gethash 'window/showDocument
+                                        copilot--request-handlers))
+                     (uri (concat "file://" temp-file))
+                     (result (funcall handler
+                                      (list :uri uri :takeFocus :json-false))))
+                (expect 'display-buffer :to-have-been-called)
+                (expect 'find-file-noselect :to-have-been-called)
+                (expect (plist-get result :success) :to-equal t)))
+          (delete-file temp-file))))
+
+    (it "opens external URIs with browse-url"
+      (spy-on 'browse-url)
+      (let* ((handler (gethash 'window/showDocument
+                                copilot--request-handlers))
+             (result (funcall handler
+                              '(:uri "vscode://extension" :external t))))
+        (expect 'browse-url :to-have-been-called-with "vscode://extension")
+        (expect (plist-get result :success) :to-equal t)))
+
+    (it "returns success false on error"
+      (spy-on 'browse-url :and-call-fake
+              (lambda (&rest _) (error "Cannot open")))
+      (let* ((handler (gethash 'window/showDocument
+                                copilot--request-handlers))
+             (result (funcall handler
+                              '(:uri "https://example.com"))))
+        (expect (plist-get result :success) :to-equal :json-false))))
+
+  ;;
+  ;; $/progress handler
+  ;;
+
+  (describe "$/progress handler"
+    (it "stores session on begin and reports progress"
+      (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
+          (expect handlers :to-be-truthy)
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "begin" :title "Indexing" :message "Starting")))
+          (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
+          (let ((session (gethash "tok1" copilot--progress-sessions)))
+            (expect (plist-get session :title) :to-equal "Indexing")
+            (expect (plist-get session :message) :to-equal "Starting"))
+          (expect (copilot--progress-lighter) :to-equal " [Indexing: Starting]")
+          (expect 'force-mode-line-update :to-have-been-called-with t))))
+
+    (it "updates session on report"
+      (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "begin" :title "Indexing" :message "Starting")))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "report" :message "50 files" :percentage 42)))
+          (let ((session (gethash "tok1" copilot--progress-sessions)))
+            (expect (plist-get session :message) :to-equal "50 files")
+            (expect (plist-get session :percentage) :to-equal 42))
+          (expect (copilot--progress-lighter) :to-equal " [Indexing: 50 files]"))))
+
+    (it "removes session on end"
+      (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "begin" :title "Indexing")))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "end")))
+          (expect (hash-table-count copilot--progress-sessions) :to-equal 0)
+          (expect (copilot--progress-lighter) :to-be nil))))
+
+    (it "tracks multiple tokens independently"
+      (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "begin" :title "Indexing")))
+          (funcall (car handlers)
+                   '(:token "tok2"
+                     :value (:kind "begin" :title "Loading")))
+          (expect (hash-table-count copilot--progress-sessions) :to-equal 2)
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "end")))
+          (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
+          (expect (gethash "tok1" copilot--progress-sessions) :to-be nil)
+          (expect (gethash "tok2" copilot--progress-sessions) :to-be-truthy))))
+
+    (it "includes progress in mode-line lighter"
+      (let ((copilot--progress-sessions (make-hash-table :test 'equal))
+            (copilot--status nil))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
+          (funcall (car handlers)
+                   '(:token "tok1"
+                     :value (:kind "begin" :title "Indexing" :percentage 42)))
+          (expect (copilot--status-lighter) :to-equal " Copilot [Indexing: 42%]")))))
+
+  ;;
+  ;; Server shutdown
+  ;;
+
+  (describe "copilot--shutdown-server"
+    (it "sends shutdown request and exit notification when connection is alive"
+      (let* ((conn (make-symbol "fake-conn"))
+             (copilot--connection conn)
+             (copilot--opened-buffers '(buf1))
+             (copilot--workspace-folders '("file:///tmp")))
+        (spy-on 'jsonrpc-request)
+        (spy-on 'jsonrpc-notify)
+        (spy-on 'jsonrpc-shutdown)
+        (copilot--shutdown-server)
+        (expect 'jsonrpc-request :to-have-been-called-with
+                conn 'shutdown nil :timeout 3)
+        (expect 'jsonrpc-notify :to-have-been-called-with
+                conn 'exit nil)
+        (expect 'jsonrpc-shutdown :to-have-been-called)))
+
+    (it "handles unresponsive server gracefully"
+      (let ((copilot--connection (make-symbol "fake-conn"))
+            (copilot--opened-buffers '(buf1))
+            (copilot--workspace-folders '("file:///tmp")))
+        (spy-on 'jsonrpc-request :and-call-fake
+                (lambda (&rest _) (error "Timeout")))
+        (spy-on 'jsonrpc-notify)
+        (spy-on 'jsonrpc-shutdown)
+        ;; Should not signal an error
+        (copilot--shutdown-server)
+        ;; Should still attempt exit and cleanup
+        (expect 'jsonrpc-notify :to-have-been-called)
+        (expect 'jsonrpc-shutdown :to-have-been-called)
+        (expect copilot--connection :to-be nil)))
+
+    (it "is a no-op when connection is nil"
+      (let ((copilot--connection nil))
+        (spy-on 'jsonrpc-request)
+        (spy-on 'jsonrpc-notify)
+        (spy-on 'jsonrpc-shutdown)
+        (copilot--shutdown-server)
+        (expect 'jsonrpc-request :not :to-have-been-called)
+        (expect 'jsonrpc-notify :not :to-have-been-called)
+        (expect 'jsonrpc-shutdown :not :to-have-been-called)))
+
+    (it "resets global state"
+      (let ((copilot--connection (make-symbol "fake-conn"))
+            (copilot--opened-buffers '(buf1 buf2))
+            (copilot--workspace-folders '("file:///a" "file:///b"))
+            (copilot--status '(:kind "Error" :busy nil :message "stale")))
+        (spy-on 'jsonrpc-request)
+        (spy-on 'jsonrpc-notify)
+        (spy-on 'jsonrpc-shutdown)
+        (copilot--shutdown-server)
+        (expect copilot--connection :to-be nil)
+        (expect copilot--opened-buffers :to-be nil)
+        (expect copilot--workspace-folders :to-be nil)
+        (expect copilot--status :to-be nil))))
+
+  ;;
+  ;; $/cancelRequest
+  ;;
+
+  (describe "copilot--cancel-completion"
+    (it "sends $/cancelRequest and clears ID when request is in-flight"
+      (with-temp-buffer
+        (setq-local copilot--completion-request-id 42)
+        (let ((copilot--connection t))
+          (spy-on 'jsonrpc--process :and-return-value t)
+          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'jsonrpc-notify)
+          (copilot--cancel-completion)
+          (expect 'jsonrpc-notify :to-have-been-called-with
+                  t '$/cancelRequest '(:id 42))
+          (expect copilot--completion-request-id :to-be nil))))
+
+    (it "is a no-op when no request is in-flight"
+      (with-temp-buffer
+        (setq-local copilot--completion-request-id nil)
+        (spy-on 'jsonrpc-notify)
+        (copilot--cancel-completion)
+        (expect 'jsonrpc-notify :not :to-have-been-called)))
+
+    (it "clears ID without notifying when connection is dead"
+      (with-temp-buffer
+        (setq-local copilot--completion-request-id 99)
+        (let ((copilot--connection nil))
+          (spy-on 'jsonrpc-notify)
+          (copilot--cancel-completion)
+          (expect 'jsonrpc-notify :not :to-have-been-called)
+          (expect copilot--completion-request-id :to-be nil)))))
+
+  (describe "copilot-clear-overlay cancellation"
+    (it "cancels in-flight request when clearing overlay"
+      (with-temp-buffer
+        (spy-on 'copilot--cancel-completion)
+        (setq-local copilot--overlay nil)
+        (copilot-clear-overlay)
+        (expect 'copilot--cancel-completion :to-have-been-called))))
+
   (describe "copilot--path-to-uri"
     (it "creates a file URI for unix paths"
       (expect (copilot--path-to-uri "/home/user/project")
-              :to-match "^file:///home/user/project"))))
+              :to-match "^file:///home/user/project")))
+
+  (describe "copilot--ensure-doc-open"
+    (it "sends didOpen when buffer is not yet registered"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(+ 1 2)")
+        (let ((copilot--opened-buffers nil)
+              (copilot--connection t))
+          (spy-on 'jsonrpc--process :and-return-value t)
+          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'jsonrpc-notify)
+          (copilot--ensure-doc-open)
+          (expect (seq-contains-p copilot--opened-buffers (current-buffer))
+                  :to-be-truthy)
+          ;; Should have sent textDocument/didOpen
+          (let ((calls (spy-calls-all-args 'jsonrpc-notify)))
+            (expect (cl-some (lambda (args) (eq (nth 1 args) 'textDocument/didOpen))
+                             calls)
+                    :to-be-truthy)))))
+
+    (it "is a no-op when buffer is already registered"
+      (with-temp-buffer
+        (let ((copilot--opened-buffers (list (current-buffer)))
+              (copilot--connection t))
+          (spy-on 'jsonrpc--process :and-return-value t)
+          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'jsonrpc-notify)
+          (copilot--ensure-doc-open)
+          (expect 'jsonrpc-notify :not :to-have-been-called))))))
 
 ;;
 ;; copilot-balancer
 ;;
 
 (describe "copilot-balancer"
-  (describe "copilot-balancer-extract-pairs"
-    (it "extracts parentheses"
-      (let ((pairs (copilot-balancer-extract-pairs "(foo (bar))")))
-        (expect pairs :to-equal '(?\( ?\( ?\) ?\)))))
-
-    (it "extracts brackets and braces"
-      (let ((pairs (copilot-balancer-extract-pairs "[{x}]")))
-        (expect pairs :to-equal '(?\[ ?\{ ?\} ?\]))))
-
-    (it "returns empty list for no pairs"
-      (expect (copilot-balancer-extract-pairs "hello") :to-equal nil))
-
-    (it "skips escaped characters"
-      (let ((pairs (copilot-balancer-extract-pairs "\\(foo)")))
-        (expect pairs :to-equal '(?\))))))
-
   (describe "copilot-balancer-trim-closing-pairs-at-end"
     (it "trims trailing closing parens"
       (expect (copilot-balancer-trim-closing-pairs-at-end "foo))") :to-equal "foo"))
@@ -612,16 +967,10 @@
       (expect (copilot-balancer-trim-closing-pairs-at-end "hello") :to-equal "hello"))
 
     (it "does not trim escaped closers"
-      (expect (copilot-balancer-trim-closing-pairs-at-end "foo\\)") :to-equal "foo\\)")))
+      (expect (copilot-balancer-trim-closing-pairs-at-end "foo\\)") :to-equal "foo\\)"))
 
-  (describe "copilot-balancer-collapse-matching-pairs"
-    (it "collapses matching open-close pairs"
-      (let ((result (copilot-balancer-collapse-matching-pairs '(?\( ?\)) nil)))
-        (expect (car result) :to-equal nil)))
-
-    (it "preserves unmatched pairs"
-      (let ((result (copilot-balancer-collapse-matching-pairs '(?\( ?\( ?\)) nil)))
-        (expect (car result) :to-equal '(?\()))))
+    (it "does not trim trailing double quotes"
+      (expect (copilot-balancer-trim-closing-pairs-at-end "foo\"") :to-equal "foo\"")))
 
   (describe "copilot-balancer-fix-completion"
     (it "passes through completion in non-lisp modes"
@@ -630,6 +979,14 @@
         (insert "hello ")
         (let ((result (copilot-balancer-fix-completion (point) (point) "world")))
           (expect (nth 2 result) :to-equal "world"))))
+
+    (it "passes through when balancer is disabled"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(defun foo ()\n  (bar")
+        (let ((copilot-enable-parentheses-balancer nil))
+          (let ((result (copilot-balancer-fix-completion (point) (point) "")))
+            (expect (nth 2 result) :to-equal "")))))
 
     (it "balances parentheses in emacs-lisp-mode"
       (with-temp-buffer
@@ -646,6 +1003,124 @@
         (let* ((completion "(bar))")
                (result (copilot-balancer-fix-completion (point) (point) completion)))
           ;; Should return something reasonable
-          (expect (nth 2 result) :to-be-truthy))))))
+          (expect (nth 2 result) :to-be-truthy))))
+
+    (it "ignores parens inside comments"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(defun foo ()\n  ;; a stray (\n  (bar")
+        (let ((result (copilot-balancer-fix-completion (point) (point) "")))
+          ;; Should close (bar and (defun, not the comment paren
+          (expect (nth 2 result) :to-equal "))"))))
+
+    (it "ignores parens inside strings"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(defun foo ()\n  (message \"(\"")
+        (let ((result (copilot-balancer-fix-completion (point) (point) "")))
+          ;; Should close (message and (defun, not the string paren
+          (expect (nth 2 result) :to-equal "))"))))
+
+    (it "handles mixed bracket types"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(let ([a 1]")
+        (let ((result (copilot-balancer-fix-completion (point) (point) "")))
+          ;; [a 1] is balanced; two ( remain unmatched
+          (expect (nth 2 result) :to-equal "))"))))
+
+    (it "accounts for closers in suffix"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(defun foo ()\n  (bar")
+        (save-excursion (insert "))\n"))
+        (let ((result (copilot-balancer-fix-completion (point) (point) "")))
+          ;; Suffix already has the closing parens, no extras needed
+          (expect (nth 2 result) :to-equal ""))))
+
+    (it "strips redundant closers when suffix has them"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert "(defun add (a ")
+        (save-excursion (insert "))\n"))
+        (let ((result (copilot-balancer-fix-completion (point) (point) "b))")))
+          ;; Suffix )) already closes both parens; trimmed completion is just "b"
+          (expect (nth 2 result) :to-equal "b"))))
+
+    (it "keeps comment closers when server uses a replacement range"
+      (with-temp-buffer
+        (emacs-lisp-mode)
+        (insert ";; (require cl-)")
+        (search-backward ")")
+        (let* ((start (point))
+               (end (1+ start))
+               (result (copilot-balancer-fix-completion start end "lib")))
+          (expect (nth 2 result) :to-equal "lib)"))))))
+
+  ;;
+  ;; copilot-accept-completion
+  ;;
+
+  (describe "copilot-accept-completion"
+    (it "accepts full completion"
+      (with-temp-buffer
+        (insert "(defun add (a ")
+        (save-excursion (insert "))"))
+        (spy-on 'copilot--notify)
+        (spy-on 'copilot--async-request)
+        (copilot--display-overlay-completion "b)" nil nil (point) (+ (point) 2))
+        (copilot-accept-completion)
+        (expect (buffer-string) :to-equal "(defun add (a b)")
+        (expect (copilot--overlay-visible) :not :to-be-truthy)))
+
+    (it "accepts completion by word"
+      (with-temp-buffer
+        (insert "(defun add (a ")
+        (save-excursion (insert "))"))
+        (spy-on 'copilot--notify)
+        (spy-on 'copilot--async-request)
+        (copilot--display-overlay-completion "b)\n  (+ a b))" nil nil (point) (+ (point) 2))
+        (copilot-accept-completion-by-word)
+        (expect (buffer-substring-no-properties (point-min) (point))
+                :to-equal "(defun add (a b")
+        (expect (copilot--overlay-visible) :to-be-truthy)
+        (expect (overlay-get copilot--overlay 'completion)
+                :to-equal ")\n  (+ a b))")))
+
+    (it "accepts by word with replacement range"
+      (with-temp-buffer
+        (insert "(defun add (a ")
+        (let ((start (point)))
+          (save-excursion (insert "))"))
+          (let ((end (+ start 2)))
+            (spy-on 'copilot--notify)
+            (spy-on 'copilot--async-request)
+            (copilot--display-overlay-completion "b)\n  (+ a b))" nil nil start end)
+            (copilot-accept-completion-by-word)
+            ;; First word "b" inserted; replacement range "))" preserved
+            (expect (buffer-substring-no-properties (point-min) (line-end-position))
+                    :to-equal "(defun add (a b))")
+            (expect (copilot--overlay-visible) :to-be-truthy)
+            ;; Second accept-by-word inserts ")\n  (+ a", deletes "))"
+            (copilot-accept-completion-by-word)
+            (expect (buffer-string) :to-equal "(defun add (a b)\n  (+ a))")))))
+
+    (it "accepts by word with replacement range and trailing text"
+      (with-temp-buffer
+        (insert "(let ((x ")
+        (let ((start (point)))
+          (save-excursion (insert ")) ; trailing"))
+          (let ((end (+ start 2)))
+            (spy-on 'copilot--notify)
+            (spy-on 'copilot--async-request)
+            (copilot--display-overlay-completion "(+ 1 2)" nil nil start end)
+            (copilot-accept-completion-by-word)
+            ;; forward-word on "(+ 1 2)" skips "(+ " then matches "1" -> "(+ 1"
+            ;; Replacement range "))" preserved, trailing text intact
+            (expect (buffer-string) :to-equal "(let ((x (+ 1)) ; trailing")
+            (expect (copilot--overlay-visible) :to-be-truthy)
+            ;; Second accept inserts " 2", remaining ")" shown as overlay
+            (copilot-accept-completion-by-word)
+            (expect (buffer-string) :to-equal "(let ((x (+ 1 2)) ; trailing"))))))
 
 ;;; copilot-test.el ends here
