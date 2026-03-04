@@ -57,6 +57,40 @@
         ;; params should be a hash table (serializes to {}), not nil
         (expect (hash-table-p sent-params) :to-be-truthy))))
 
+  (describe "copilot--async-request"
+    (it "uses a default error-fn that logs via copilot--log"
+      (let ((captured-error-fn nil))
+        (spy-on 'copilot--connection-alivep :and-return-value t)
+        (spy-on 'jsonrpc--async-request-1 :and-call-fake
+                (lambda (_conn _method _params &rest args)
+                  (setq captured-error-fn (plist-get args :error-fn))
+                  (list 1)))
+        (copilot--async-request 'textDocument/inlineCompletion
+                                '(:textDocument (:uri "file:///test")))
+        (expect captured-error-fn :to-be-truthy)
+        ;; Call the error-fn and verify it logs
+        (spy-on 'copilot--log)
+        (funcall captured-error-fn '(:code -32600 :message "cancelled"))
+        (expect 'copilot--log :to-have-been-called)
+        (let ((args (spy-calls-args-for 'copilot--log 0)))
+          (expect (car args) :to-equal 'error)
+          (expect (apply #'format (cdr args)) :to-match "textDocument/inlineCompletion"))))
+
+    (it "uses caller-provided error-fn when supplied"
+      (let ((captured-error-fn nil)
+            (custom-called nil))
+        (spy-on 'copilot--connection-alivep :and-return-value t)
+        (spy-on 'jsonrpc--async-request-1 :and-call-fake
+                (lambda (_conn _method _params &rest args)
+                  (setq captured-error-fn (plist-get args :error-fn))
+                  (list 1)))
+        (copilot--async-request 'test/method '(:foo "bar")
+                                :error-fn (lambda (_err)
+                                            (setq custom-called t)))
+        (expect captured-error-fn :to-be-truthy)
+        (funcall captured-error-fn '(:code -1 :message "test"))
+        (expect custom-called :to-be-truthy))))
+
   ;;
   ;; Utility functions
   ;;
@@ -341,12 +375,9 @@
     (it "sends notification when connection is alive"
       (with-temp-buffer
         (add-to-list 'copilot--opened-buffers (current-buffer))
-        ;; copilot--connection-alivep is a defsubst (inlined when
-        ;; byte-compiled), so mock the underlying pieces instead.
+        (spy-on 'copilot--connection-alivep :and-return-value t)
+        (spy-on 'jsonrpc-notify)
         (let ((copilot--connection t))
-          (spy-on 'jsonrpc--process :and-return-value t)
-          (spy-on 'process-exit-status :and-return-value 0)
-          (spy-on 'jsonrpc-notify)
           (copilot--on-doc-close)
           ;; Should send didClose notification
           (expect 'jsonrpc-notify :to-have-been-called)
@@ -749,73 +780,77 @@
     (it "stores session on begin and reports progress"
       (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
         (spy-on 'force-mode-line-update)
-        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
-          (expect handlers :to-be-truthy)
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "begin" :title "Indexing" :message "Starting")))
-          (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
-          (let ((session (gethash "tok1" copilot--progress-sessions)))
-            (expect (plist-get session :title) :to-equal "Indexing")
-            (expect (plist-get session :message) :to-equal "Starting"))
-          (expect (copilot--progress-lighter) :to-equal " [Indexing: Starting]")
-          (expect 'force-mode-line-update :to-have-been-called-with t))))
+        (expect (gethash '$/progress copilot--notification-handlers) :to-be-truthy)
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "begin" :title "Indexing" :message "Starting")))
+        (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
+        (let ((session (gethash "tok1" copilot--progress-sessions)))
+          (expect (plist-get session :title) :to-equal "Indexing")
+          (expect (plist-get session :message) :to-equal "Starting"))
+        (expect (copilot--progress-lighter) :to-equal " [Indexing: Starting]")
+        (expect 'force-mode-line-update :to-have-been-called-with t)))
 
     (it "updates session on report"
       (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
         (spy-on 'force-mode-line-update)
-        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "begin" :title "Indexing" :message "Starting")))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "report" :message "50 files" :percentage 42)))
-          (let ((session (gethash "tok1" copilot--progress-sessions)))
-            (expect (plist-get session :message) :to-equal "50 files")
-            (expect (plist-get session :percentage) :to-equal 42))
-          (expect (copilot--progress-lighter) :to-equal " [Indexing: 50 files]"))))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "begin" :title "Indexing" :message "Starting")))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "report" :message "50 files" :percentage 42)))
+        (let ((session (gethash "tok1" copilot--progress-sessions)))
+          (expect (plist-get session :message) :to-equal "50 files")
+          (expect (plist-get session :percentage) :to-equal 42))
+        (expect (copilot--progress-lighter) :to-equal " [Indexing: 50 files]")))
 
     (it "removes session on end"
       (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
         (spy-on 'force-mode-line-update)
-        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "begin" :title "Indexing")))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "end")))
-          (expect (hash-table-count copilot--progress-sessions) :to-equal 0)
-          (expect (copilot--progress-lighter) :to-be nil))))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "begin" :title "Indexing")))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "end")))
+        (expect (hash-table-count copilot--progress-sessions) :to-equal 0)
+        (expect (copilot--progress-lighter) :to-be nil)))
 
     (it "tracks multiple tokens independently"
       (let ((copilot--progress-sessions (make-hash-table :test 'equal)))
         (spy-on 'force-mode-line-update)
-        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "begin" :title "Indexing")))
-          (funcall (car handlers)
-                   '(:token "tok2"
-                     :value (:kind "begin" :title "Loading")))
-          (expect (hash-table-count copilot--progress-sessions) :to-equal 2)
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "end")))
-          (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
-          (expect (gethash "tok1" copilot--progress-sessions) :to-be nil)
-          (expect (gethash "tok2" copilot--progress-sessions) :to-be-truthy))))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "begin" :title "Indexing")))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok2"
+           :value (:kind "begin" :title "Loading")))
+        (expect (hash-table-count copilot--progress-sessions) :to-equal 2)
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "end")))
+        (expect (hash-table-count copilot--progress-sessions) :to-equal 1)
+        (expect (gethash "tok1" copilot--progress-sessions) :to-be nil)
+        (expect (gethash "tok2" copilot--progress-sessions) :to-be-truthy)))
 
     (it "includes progress in mode-line lighter"
       (let ((copilot--progress-sessions (make-hash-table :test 'equal))
             (copilot--status nil))
         (spy-on 'force-mode-line-update)
-        (let ((handlers (gethash '$/progress copilot--notification-handlers)))
-          (funcall (car handlers)
-                   '(:token "tok1"
-                     :value (:kind "begin" :title "Indexing" :percentage 42)))
-          (expect (copilot--status-lighter) :to-equal " Copilot [Indexing: 42%]")))))
+        (copilot--handle-notification
+         nil '$/progress
+         '(:token "tok1"
+           :value (:kind "begin" :title "Indexing" :percentage 42)))
+        (expect (copilot--status-lighter) :to-equal " Copilot [Indexing: 42%]"))))
 
   ;;
   ;; Server shutdown
@@ -885,8 +920,7 @@
       (with-temp-buffer
         (setq-local copilot--completion-request-id 42)
         (let ((copilot--connection t))
-          (spy-on 'jsonrpc--process :and-return-value t)
-          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'copilot--connection-alivep :and-return-value t)
           (spy-on 'jsonrpc-notify)
           (copilot--cancel-completion)
           (expect 'jsonrpc-notify :to-have-been-called-with
@@ -917,6 +951,42 @@
         (copilot-clear-overlay)
         (expect 'copilot--cancel-completion :to-have-been-called))))
 
+  (describe "copilot--post-command"
+    (it "does not clear overlay when copilot--completion-initiated-p is set"
+      (with-temp-buffer
+        (setq-local copilot--completion-initiated-p t)
+        (let ((this-command 'my/copilot-wrapper))
+          (spy-on 'copilot-clear-overlay)
+          (copilot--post-command)
+          (expect 'copilot-clear-overlay :not :to-have-been-called)
+          (expect copilot--completion-initiated-p :to-be nil))))
+
+    (it "clears overlay for non-copilot commands without the flag"
+      (with-temp-buffer
+        (setq-local copilot--completion-initiated-p nil)
+        (let ((this-command 'my/random-command))
+          (spy-on 'copilot-clear-overlay)
+          (copilot--post-command)
+          (expect 'copilot-clear-overlay :to-have-been-called))))
+
+    (it "resets the flag even when command is a copilot- command"
+      (with-temp-buffer
+        (setq-local copilot--completion-initiated-p t)
+        (let ((this-command 'copilot-complete))
+          (spy-on 'copilot-clear-overlay)
+          (copilot--post-command)
+          (expect copilot--completion-initiated-p :to-be nil)))))
+
+  (describe "copilot--post-command-debounce"
+    (it "clears completion-initiated flag after calling copilot-complete"
+      (with-temp-buffer
+        (setq-local copilot-mode t)
+        (spy-on 'copilot-complete)
+        (spy-on 'copilot--satisfy-trigger-predicates :and-return-value t)
+        (copilot--post-command-debounce (current-buffer))
+        (expect 'copilot-complete :to-have-been-called)
+        (expect copilot--completion-initiated-p :to-be nil))))
+
   (describe "copilot--path-to-uri"
     (it "creates a file URI for unix paths"
       (expect (copilot--path-to-uri "/home/user/project")
@@ -929,8 +999,7 @@
         (insert "(+ 1 2)")
         (let ((copilot--opened-buffers nil)
               (copilot--connection t))
-          (spy-on 'jsonrpc--process :and-return-value t)
-          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'copilot--connection-alivep :and-return-value t)
           (spy-on 'jsonrpc-notify)
           (copilot--ensure-doc-open)
           (expect (seq-contains-p copilot--opened-buffers (current-buffer))
@@ -945,8 +1014,7 @@
       (with-temp-buffer
         (let ((copilot--opened-buffers (list (current-buffer)))
               (copilot--connection t))
-          (spy-on 'jsonrpc--process :and-return-value t)
-          (spy-on 'process-exit-status :and-return-value 0)
+          (spy-on 'copilot--connection-alivep :and-return-value t)
           (spy-on 'jsonrpc-notify)
           (copilot--ensure-doc-open)
           (expect 'jsonrpc-notify :not :to-have-been-called))))))

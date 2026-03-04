@@ -4,6 +4,25 @@
 
 ### New Features
 
+- Add Copilot Chat support (`copilot-chat`, `copilot-chat-send`, `copilot-chat-send-region`, `copilot-chat-reset`) using the `conversation/*` LSP methods. ([#446](https://github.com/copilot-emacs/copilot.el/pull/446))
+- Add Next Edit Suggestions (`copilot-nes-mode`) via `textDocument/copilotInlineEdit`. NES predicts edits anywhere in the file based on recent editing patterns. ([#447](https://github.com/copilot-emacs/copilot.el/pull/447))
+- Add Chat, NES, Panel Complete, Clear Overlay, Select Completion Model, and Reinstall Server entries to the Copilot mode menu.
+
+### Changes
+
+- Add a default error handler to `copilot--async-request` so async failures (e.g. cancelled completions) are logged to `*Messages*` instead of being silently swallowed.
+- Remove unused `copilot-server-log-level` defcustom (dead code — nothing read it).
+- Improve `copilot-log-max` docstring to explain the `*copilot events*` buffer.
+
+### Bug Fixes
+
+- Fix chat `conversation/create` sending `allSkills` as a string array instead of a boolean, which caused a schema validation error on `copilot-language-server` v1.436.0+. ([#452](https://github.com/copilot-emacs/copilot.el/issues/452))
+- Fix `copilot-complete` being immediately cancelled when called from wrapper commands (lambdas, user-defined functions) whose name doesn't start with `copilot-`. ([#453](https://github.com/copilot-emacs/copilot.el/issues/453))
+
+## 0.4.0 (2026-02-26)
+
+### New Features
+
 - Send workspace folders (`rootUri` and `workspaceFolders`) during LSP initialization and dynamically notify the server when new project roots are encountered. This improves suggestion quality for multi-root workspaces.
 - Add `copilot-completion-model` option and `copilot-select-completion-model` command for choosing the AI model used for completions. ([#382](https://github.com/copilot-emacs/copilot.el/issues/382))
 - Add `copilot-enable-parentheses-balancer` option to control whether Lisp completions are post-processed for balanced delimiters (enabled by default).
@@ -32,6 +51,7 @@
 
 - Rewrite `copilot-balancer` to use `parse-partial-sexp` so that parens inside comments and strings are handled correctly. ([#440](https://github.com/copilot-emacs/copilot.el/issues/440))
 - Fix balancer dropping closing delimiters inside comments/strings when the server returns a replacement range covering them. ([#449](https://github.com/copilot-emacs/copilot.el/issues/449))
+- Fix `copilot-complete` not working without `copilot-mode` until `copilot-diagnose` is run, by sending `textDocument/didOpen` automatically. ([#450](https://github.com/copilot-emacs/copilot.el/issues/450))
 - Fix partial accept-by-word losing the replacement range tail, which caused suffix text to be deleted prematurely. ([#448](https://github.com/copilot-emacs/copilot.el/issues/448))
 - Send an empty JSON object instead of omitting `params` in JSON-RPC requests, fixing `signInInitiate` and other calls on newer language server versions. ([#445](https://github.com/copilot-emacs/copilot.el/issues/445))
 - Fix `copilot--lsp-pos` to use UTF-16 code unit offsets instead of Emacs character counts. Characters above U+FFFF (e.g. emoji) are now correctly reported as 2 UTF-16 code units.

@@ -1,15 +1,12 @@
-;;; copilot.el --- An unofficial Copilot plugin -*- lexical-binding: t; -*-
+;;; copilot.el --- An Emacs plugin for GitHub Copilot -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2022-2025 copilot-emacs maintainers
+;; Copyright (C) 2022-2026 copilot-emacs maintainers
 
 ;; Author: zerol <z@zerol.me>
-;; Maintainer: Emil van der Westhuizen
-;;             Shen, Jen-Chieh <jcs090218@gmail.com>
-;;             Rakotomandimby Mihamina <mihamina.rakotomandimby@rktmb.org>
-;;             Bozhidar Batsov <bozhidar@batsov.dev>
+;; Maintainer: Bozhidar Batsov <bozhidar@batsov.dev>
 ;; URL: https://github.com/copilot-emacs/copilot.el
 ;; Package-Requires: ((emacs "27.2") (editorconfig "0.8.2") (jsonrpc "1.0.14") (compat "30") (track-changes "1.4"))
-;; Version: 0.4.0-snapshot
+;; Version: 0.4.0
 ;; Keywords: convenience copilot
 
 ;; The MIT License (MIT)
@@ -34,7 +31,7 @@
 
 ;;; Commentary:
 
-;; An unofficial Copilot plugin for Emacs
+;; An Emacs plugin for GitHub Copilot
 
 ;;; Code:
 
@@ -85,20 +82,12 @@ to disable TLS verification.  This can be done by setting a pair
   :package-version '(copilot . "0.1"))
 
 (defcustom copilot-log-max 0
-  "Max size of events buffer.
-0 disables, nil means infinite.  Enabling event logging may slightly affect
+  "Max size of the `*copilot events*' jsonrpc events buffer.
+This buffer records all JSON-RPC traffic between Emacs and the Copilot
+language server, which is useful for debugging protocol-level issues.
+Set to a positive integer (e.g. 1000) to enable, 0 to disable, or nil
+for unlimited size.  Enabling event logging may slightly affect
 performance."
-  :group 'copilot
-  :type 'integer
-  :package-version '(copilot . "0.1"))
-
-(defcustom copilot-server-log-level 0
-  "Log level of the Copilot server.
-0 - no log
-1 - error
-2 - warning
-3 - info
-4 - debug"
   :group 'copilot
   :type 'integer
   :package-version '(copilot . "0.1"))
@@ -153,7 +142,8 @@ When non-nil, completions in Lisp modes are adjusted to ensure that
 parentheses remain balanced within the surrounding top-level form.
 Set to nil to use completions from the server verbatim."
   :type 'boolean
-  :group 'copilot)
+  :group 'copilot
+  :package-version '(copilot . "0.4"))
 
 (defcustom copilot-indentation-alist
   (append '((emacs-lisp-mode lisp-indent-offset)
@@ -241,7 +231,7 @@ from available models."
   :type '(choice (const :tag "Default" nil)
                  (string :tag "Model ID"))
   :group 'copilot
-  :package-version '(copilot . "0.5"))
+  :package-version '(copilot . "0.4"))
 
 (defvar-local copilot--overlay nil
   "Overlay for Copilot completion.")
@@ -326,7 +316,7 @@ recently updated session."
   `(cl-destructuring-bind (&key ,@pattern &allow-other-keys) ,source
      ,@body))
 
-(defsubst copilot--log (level format &rest args)
+(defun copilot--log (level format &rest args)
   "Log message with LEVEL, FORMAT and ARGS."
   (message "%s: %s" (propertize "Copilot" 'face
                                 (pcase level
@@ -469,7 +459,7 @@ recently updated session."
   (lambda (_))
   "Simply ignore the response.")
 
-(defsubst copilot--connection-alivep ()
+(defun copilot--connection-alivep ()
   "Non-nil if the `copilot--connection' is alive."
   (and copilot--connection
        (zerop (process-exit-status (jsonrpc--process copilot--connection)))))
@@ -490,27 +480,42 @@ reject the request with a schema-validation error."
        (copilot--start-server))
      (jsonrpc-notify copilot--connection ,@args)))
 
-(cl-defmacro copilot--async-request (method params &rest args &key (success-fn #'copilot--ignore-response) &allow-other-keys)
+(cl-defmacro copilot--async-request (method params &rest args
+                                    &key
+                                    (success-fn #'copilot--ignore-response)
+                                    (error-fn nil error-fn-supplied-p)
+                                    &allow-other-keys)
   "Send an asynchronous request to the copilot server.
 
 Arguments METHOD, PARAMS and ARGS are used in function `jsonrpc-async-request'.
 
 SUCCESS-FN is the CALLBACK.
 
+ERROR-FN is called when the request fails.  When omitted, a default
+handler logs the error to *Messages* via `copilot--log'.
+
 Returns the request ID (a number) so callers can cancel the request later."
-  `(progn
-     (unless (copilot--connection-alivep)
-       (copilot--start-server))
-     ;; jsonrpc will use temp buffer for callbacks, so we need to save the
-     ;; current buffer and restore it inside callback
-     (let ((buf (current-buffer)))
-       (car (jsonrpc--async-request-1 copilot--connection
-                                      ,method ,params
-                                      :success-fn (lambda (result)
-                                                    (if (buffer-live-p buf)
-                                                        (with-current-buffer buf
-                                                          (funcall ,success-fn result))))
-                                      ,@args)))))
+  (let ((filtered-args (cl-loop for (k v) on args by #'cddr
+                                unless (eq k :error-fn)
+                                append (list k v))))
+    `(progn
+       (unless (copilot--connection-alivep)
+         (copilot--start-server))
+       ;; jsonrpc will use temp buffer for callbacks, so we need to save the
+       ;; current buffer and restore it inside callback
+       (let ((buf (current-buffer)))
+         (car (jsonrpc--async-request-1 copilot--connection
+                                        ,method ,params
+                                        :success-fn (lambda (result)
+                                                      (if (buffer-live-p buf)
+                                                          (with-current-buffer buf
+                                                            (funcall ,success-fn result))))
+                                        :error-fn ,(if error-fn-supplied-p
+                                                       error-fn
+                                                     `(lambda (err)
+                                                        (copilot--log 'error "%s failed: %S"
+                                                                      ,method err)))
+                                        ,@filtered-args))))))
 
 (defun copilot--shutdown-server ()
   "Shut down the Copilot server with the standard LSP shutdown sequence.
@@ -650,7 +655,11 @@ automatically, browse to %s." user-code verification-uri))
 ;;
 
 (defun copilot-diagnose ()
-  "Restart and diagnose copilot."
+  "Restart the Copilot server and send a test completion request.
+Shuts down any running server, starts a fresh one, and fires a
+`textDocument/inlineCompletion' request for the current buffer.
+The result is logged to *Messages*: look for \"Copilot: Copilot OK.\"
+on success, or an error/timeout message on failure."
   (interactive)
   (copilot--shutdown-server)
   ;; We are going to send a test request for the current buffer so we have to activate the mode
@@ -666,8 +675,6 @@ automatically, browse to %s." user-code verification-uri))
                                 :context '(:triggerKind 1))
                           :success-fn (lambda (_)
                                         (copilot--log 'info "Copilot OK."))
-                          :error-fn (lambda (err)
-                                      (copilot--log 'error "%S" err))
                           :timeout-fn (lambda ()
                                         (copilot--log 'warning "Copilot server timeout."))))
 
@@ -734,6 +741,11 @@ automatically, browse to %s." user-code verification-uri))
 
 (defvar-local copilot--completion-request-id nil
   "Request ID of the in-flight completion request, or nil.")
+
+(defvar-local copilot--completion-initiated-p nil
+  "Non-nil when `copilot-complete' was called during the current command.
+Used to prevent `copilot--post-command' from immediately cancelling
+a request that was just initiated by a wrapper command.")
 
 (defun copilot--cancel-completion ()
   "Cancel the in-flight completion request, if any.
@@ -823,11 +835,10 @@ Sends `$/cancelRequest' to the server and resets the stored request ID."
       (when (and buffer-file-name
                  (>= copilot-max-char 0)
                  (> pmax copilot-max-char))
-        (let ((msg (format "%s size exceeds 'copilot-max-char' (%s), copilot completions may not work"
-                           (current-buffer) copilot-max-char)))
-          (if copilot-max-char-warning-disable
-              (message msg)
-            (display-warning '(copilot copilot-exceeds-max-char) msg))))
+        (unless copilot-max-char-warning-disable
+          (display-warning '(copilot copilot-exceeds-max-char)
+                           (format "%s size exceeds 'copilot-max-char' (%s), copilot completions may not work"
+                                   (current-buffer) copilot-max-char))))
       (cond
        ;; using whole buffer
        ((or (< copilot-max-char 0) (< pmax copilot-max-char))
@@ -965,7 +976,7 @@ TRIGGER-KIND is 1 for invoked, 2 for automatic (default)."
            (setq copilot--completion-idx (mod (+ copilot--completion-idx direction) len))
            (copilot--show-completion (nth copilot--completion-idx items))))))
 
-(defsubst copilot--overlay-visible ()
+(defun copilot--overlay-visible ()
   "Return whether the `copilot--overlay' is available."
   (and (overlayp copilot--overlay)
        (overlay-buffer copilot--overlay)))
@@ -1049,7 +1060,7 @@ Each request METHOD can have only one HANDLER."
 (copilot-on-notification
  'PanelSolutionsDone
  (lambda (_msg)
-   (message "Copilot: Finish synthesizing solutions.")
+   (copilot--log 'info "Finished synthesizing solutions.")
    (display-buffer "*copilot-panel*")
    (with-current-buffer "*copilot-panel*"
      (save-excursion
@@ -1128,8 +1139,6 @@ Each request METHOD can have only one HANDLER."
                           (list :doc (copilot--generate-doc)
                                 :panelId (generate-new-buffer-name "copilot-panel"))
                           :success-fn callback
-                          :error-fn (lambda (err)
-                                      (copilot--log 'error "%S" err))
                           :timeout-fn (lambda ()
                                         (copilot--log 'warning "Copilot server timeout."))))
 
@@ -1444,6 +1453,7 @@ the buffer has not been registered yet.  Safe to call multiple times."
   (interactive)
   (copilot--ensure-doc-open)
   (setq copilot--last-doc-version copilot--doc-version)
+  (setq copilot--completion-initiated-p t)
 
   (setq copilot--completion-cache nil)
   (setq copilot--completion-idx 0)
@@ -1576,25 +1586,28 @@ consistently even when the overlay is visible."
 
 (defun copilot--post-command ()
   "Complete in `post-command-hook' hook."
-  (when (and this-command
-             (not (and (symbolp this-command)
-                       (or
-                        (string-prefix-p "copilot-" (symbol-name this-command))
-                        (member this-command copilot-clear-overlay-ignore-commands)
-                        ;; `this-original-command' captures remapped helpers like
-                        ;; `universal-argument-more' and `digit-argument'.
-                        (member this-original-command copilot-clear-overlay-ignore-commands)
-                        (member this-original-command copilot--hardcoded-clear-overlay-ignore-commands)
-                        (copilot--self-insert this-command)))))
-    (copilot-clear-overlay)
-    (when copilot--post-command-timer
-      (cancel-timer copilot--post-command-timer))
-    (when (numberp copilot-idle-delay)
-      (setq copilot--post-command-timer
-            (run-with-idle-timer copilot-idle-delay
-                                 nil
-                                 #'copilot--post-command-debounce
-                                 (current-buffer))))))
+  (let ((completion-initiated copilot--completion-initiated-p))
+    (setq copilot--completion-initiated-p nil)
+    (when (and this-command
+               (not completion-initiated)
+               (not (and (symbolp this-command)
+                         (or
+                          (string-prefix-p "copilot-" (symbol-name this-command))
+                          (member this-command copilot-clear-overlay-ignore-commands)
+                          ;; `this-original-command' captures remapped helpers like
+                          ;; `universal-argument-more' and `digit-argument'.
+                          (member this-original-command copilot-clear-overlay-ignore-commands)
+                          (member this-original-command copilot--hardcoded-clear-overlay-ignore-commands)
+                          (copilot--self-insert this-command)))))
+      (copilot-clear-overlay)
+      (when copilot--post-command-timer
+        (cancel-timer copilot--post-command-timer))
+      (when (numberp copilot-idle-delay)
+        (setq copilot--post-command-timer
+              (run-with-idle-timer copilot-idle-delay
+                                   nil
+                                   #'copilot--post-command-debounce
+                                   (current-buffer)))))))
 
 (defun copilot--self-insert (command)
   "Handle the case where the char just inserted is the start of the completion.
@@ -1618,7 +1631,11 @@ in `post-command-hook'."
              (equal (current-buffer) buffer)
              copilot-mode
              (copilot--satisfy-trigger-predicates))
-    (copilot-complete)))
+    (copilot-complete)
+    ;; Clear the flag: idle timers don't trigger `post-command-hook', so the
+    ;; flag would otherwise persist and cause the next real command to skip
+    ;; overlay clearing.
+    (setq copilot--completion-initiated-p nil)))
 
 ;;
 ;; Minor mode definition
@@ -1630,21 +1647,30 @@ Use this for custom bindings in `copilot-mode'.")
 
 (easy-menu-define copilot-mode-menu copilot-mode-map "Copilot menu."
   '("Copilot"
+    ["Complete" copilot-complete]
+    ["Clear Overlay" copilot-clear-overlay]
     ["Accept Completion" copilot-accept-completion]
     ["Accept Completion by Word" copilot-accept-completion-by-word]
     ["Accept Completion by Line" copilot-accept-completion-by-line]
     ["Accept Completion by Paragraph" copilot-accept-completion-by-paragraph]
-    "--"
-    ["Complete" copilot-complete]
     ["Next Completion" copilot-next-completion]
     ["Previous Completion" copilot-previous-completion]
+    ["Panel Complete" copilot-panel-complete]
+    "--"
+    ["Chat" copilot-chat]
+    ["Chat Send Region" copilot-chat-send-region]
+    ["Chat Reset" copilot-chat-reset]
+    "--"
+    ["Toggle NES Mode" copilot-nes-mode]
+    "--"
+    ["Select Completion Model" copilot-select-completion-model]
+    ["Login" copilot-login]
+    ["Logout" copilot-logout]
     "--"
     ["Install Server" copilot-install-server]
+    ["Reinstall Server" copilot-reinstall-server]
     ["Uninstall Server" copilot-uninstall-server]
-    ["Diagnose" copilot-diagnose]
-    "--"
-    ["Login" copilot-login]
-    ["Logout" copilot-logout]))
+    ["Diagnose" copilot-diagnose]))
 
 (defun copilot--mode-setup ()
   "Set up copilot mode."

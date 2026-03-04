@@ -2,18 +2,25 @@
 [![MELPA](http://melpa.org/packages/copilot-badge.svg)](http://melpa.org/#/copilot)
 [![MELPA Stable](http://stable.melpa.org/packages/copilot-badge.svg)](http://stable.melpa.org/#/copilot)
 [![CI](https://github.com/copilot-emacs/copilot.el/actions/workflows/test.yml/badge.svg)](https://github.com/copilot-emacs/copilot.el/actions/workflows/test.yml)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/bbatsov?style=flat&logo=github&label=Sponsors&color=ea4aaa)](https://github.com/sponsors/bbatsov)
 
 # Copilot.el
 
-Copilot.el is an Emacs plugin for GitHub Copilot.
+Copilot.el is an Emacs plugin for [GitHub Copilot][]. It provides inline
+completions (ghost text), an interactive chat interface, and Next Edit
+Suggestions — all powered by the official [@github/copilot-language-server][].
 
 ![](assets/demo.gif)
 
-This plugin is unofficial, however it makes use of the official [@github/copilot-language-server][] provided by Microsoft.
+The plugin talks to the Copilot language server over JSON-RPC, using `jsonrpc.el`
+directly rather than going through an LSP client like eglot. This is a
+deliberate choice — most of the Copilot protocol is non-standard LSP, and a
+single global server is shared across all buffers and projects. See
+[doc/design.md](doc/design.md) for the full rationale.
 
 > [!NOTE]
 >
-> You need access to [GitHub Copilot][] to use this plugin. The service introduced a free layer in early 2025.
+> You need access to [GitHub Copilot][] to use this plugin. The service introduced a free tier in early 2025.
 
 ## Requirements
 
@@ -208,6 +215,54 @@ To customize when completions trigger, see `copilot-enable-predicates` and `copi
 
 Alternatively, you can call `copilot-complete` manually and use `copilot-clear-overlay` in `post-command-hook` to dismiss completions.
 
+### Chat
+
+`copilot-chat` opens an interactive chat with GitHub Copilot using the `conversation/*` LSP methods. The chat buffer streams responses in real time and automatically provides the current buffer as context.
+
+```elisp
+;; Start a chat (or send a follow-up if one is already open)
+M-x copilot-chat
+
+;; Send selected code with an optional prompt
+M-x copilot-chat-send-region
+```
+
+Key bindings in the `*copilot-chat*` buffer:
+- **C-c RET** or **C-c C-c** — send a follow-up message
+- **C-c C-k** — reset the conversation
+
+Customization:
+- **`copilot-chat-model`** — model to use for chat (default `nil`, meaning server default)
+
+For a more feature-rich chat experience, take a look at [copilot-chat.el](https://github.com/chep/copilot-chat.el).
+
+> [!WARNING]
+>
+> `copilot-chat.el` (the chep package) and `copilot.el` both provide an Emacs feature called `copilot-chat`, so they **cannot be installed at the same time**. Having both will cause autoload errors such as "failed to define function copilot-chat-display". If you want to use the chat built into `copilot.el`, make sure `chep/copilot-chat.el` is uninstalled, and vice versa.
+
+### Next Edit Suggestions (NES)
+
+NES predicts the next edit you'll want to make anywhere in the file, based on your recent editing patterns. Unlike inline completions (ghost text at the cursor), NES suggestions can replace or delete existing text at any location.
+
+> [!NOTE]
+>
+> NES requires `copilot-language-server` version 1.434.0 or newer. Run `M-x copilot-reinstall-server` to upgrade if needed.
+
+Enable `copilot-nes-mode` in a buffer to start receiving suggestions. It can coexist with `copilot-mode`:
+
+```elisp
+(add-hook 'prog-mode-hook #'copilot-nes-mode)
+```
+
+When a suggestion is pending:
+- **TAB** — accept the suggestion (jumps to it first if far away, applies on second press)
+- **C-g** — dismiss the suggestion
+
+Customization variables:
+- **`copilot-nes-idle-delay`** — seconds of idle time before requesting a suggestion (default `0.5`)
+- **`copilot-nes-auto-dismiss-move-count`** — cursor movements before auto-dismissing (default `3`)
+- **`copilot-nes-auto-dismiss-distance`** — max lines between point and suggestion before auto-dismissing (default `40`)
+
 ### Keybindings
 
 `copilot-mode` does not set any keybindings by default. Use `copilot-completion-map` (active while a completion overlay is visible) to bind keys:
@@ -312,9 +367,9 @@ For example:
 (setq copilot-network-proxy '(:host "127.0.0.1" :port 7890))
 ```
 
-### Server-side hooks (copilot-on-request / copilot-on-notification)
+### Handling server messages
 
-`copilot-on-request` registers a handler for incoming LSP requests. Return a JSON-serializable value as the result, or call `jsonrpc-error` for errors. [Read more](https://www.gnu.org/software/emacs/manual/html_node/elisp/JSONRPC-Overview.html).
+`copilot-on-request` registers a handler for incoming JSON-RPC requests from the language server. Return a JSON-serializable value as the result, or call `jsonrpc-error` for errors. [Read more](https://www.gnu.org/software/emacs/manual/html_node/elisp/JSONRPC-Overview.html).
 
 ```elisp
 ;; Display desktop notification if Emacs is built with D-Bus
@@ -362,6 +417,15 @@ For example:
 | **Navigation** | |
 | `copilot-next-completion` | Cycle to the next completion |
 | `copilot-previous-completion` | Cycle to the previous completion |
+| **Chat** | |
+| `copilot-chat` | Open Copilot Chat and send a message |
+| `copilot-chat-send` | Send a follow-up message in the current chat |
+| `copilot-chat-send-region` | Send the selected region as context with an optional prompt |
+| `copilot-chat-reset` | Destroy the current conversation and clear the chat buffer |
+| **Next Edit Suggestions** | |
+| `copilot-nes-mode` | Toggle NES in the current buffer |
+| `copilot-nes-accept` | Accept (or jump to) the current NES suggestion |
+| `copilot-nes-dismiss` | Dismiss the current NES suggestion |
 
 ## Customization
 
@@ -395,6 +459,10 @@ A few commonly tweaked variables:
 | `signInInitiate` / `signInConfirm` / `checkStatus` / `signOut` | Supported | Authentication flow |
 | `copilot/models` | Supported | Lists available completion models |
 | `getPanelCompletions` | Supported | Multiple suggestions in a panel buffer |
+| `conversation/create` | Supported | Start a new chat conversation |
+| `conversation/turn` | Supported | Send a follow-up chat message |
+| `conversation/destroy` | Supported | End a chat conversation |
+| `textDocument/copilotInlineEdit` | Supported | Next Edit Suggestions (NES) |
 
 ### Client-to-Server Notifications
 
@@ -408,6 +476,7 @@ A few commonly tweaked variables:
 | `textDocument/didFocus` | Supported | |
 | `textDocument/didShowCompletion` | Supported | Telemetry when overlay is displayed |
 | `textDocument/didPartiallyAcceptCompletion` | Supported | Telemetry for partial acceptance |
+| `textDocument/didShowInlineEdit` | Supported | Telemetry when NES overlay is displayed |
 | `workspace/didChangeConfiguration` | Supported | Sent on settings change |
 | `workspace/didChangeWorkspaceFolders` | Supported | Dynamic workspace roots |
 | `$/cancelRequest` | Supported | Cancels stale completion requests |
@@ -420,6 +489,7 @@ A few commonly tweaked variables:
 |--------|--------|-------|
 | `window/showMessageRequest` | Supported | Prompts via `completing-read` |
 | `window/showDocument` | Supported | Opens URIs in browser or Emacs |
+| `conversation/context` | Supported | Provides editor context for chat |
 
 ### Server-to-Client Notifications
 
@@ -438,30 +508,109 @@ Extensible via `copilot-on-request` and `copilot-on-notification` for any messag
 
 ![](assets/company-overlay.png)
 
-This is an example of using together with default frontend of
-`company-mode`. Because both `company-mode` and `copilot.el` use overlay to show
-completion, so the conflict is inevitable.  To solve the problem, I recommend
-you to use `company-box` (only available on GUI), which is based on child frame
-rather than overlay.
+This is an example of using together with the default frontend of
+`company-mode`. Because both `company-mode` and `copilot.el` use overlays to show
+completions, the conflict is inevitable. The recommended solution is to use
+`company-box` (only available on GUI), which is based on child frames rather than
+overlays.
 
-After using `company-box`, you have:
+After using `company-box`, you get:
 
 ![](assets/company-box.png)
 
-In other editors (e.g. `VS Code`, `PyCharm`), completions from copilot and other sources can not show at the same time.
-But I decided to allow them to coexist, allowing you to choose a better one at any time.
+In other editors (e.g. `VS Code`, `PyCharm`), completions from Copilot and other sources cannot show at the same time.
+In `copilot.el` they are allowed to coexist, so you can choose the better one at any time.
 
 ### Cursor Jumps to End of Line When Typing
 
 If you are using `whitespace-mode`, make sure to remove `newline-mark` from `whitespace-style`.
 
+## FAQ
+
+### Do I need a paid GitHub Copilot subscription?
+
+Not necessarily. GitHub introduced a [free tier](https://github.com/features/copilot#pricing) for Copilot in early 2025 that includes a limited number of completions per month. A paid subscription (Individual or Business) removes these limits.
+
+### TAB doesn't accept the completion
+
+This is usually caused by another package binding TAB in a way that takes
+priority. Common culprits include `company-mode`, `corfu`, `yasnippet`, and Evil
+mode. A few things to check:
+
+1. **Bind both `<tab>` and `TAB`.** In GUI Emacs these are different events —
+   `<tab>` is the function key and `TAB` is the `C-i` character. Some modes only
+   intercept one of them. The [Quick Start](#quick-start) example binds both.
+2. **Use the fish-style keybindings.** If TAB is hopelessly taken by another
+   package, bind acceptance to `<right>` / `C-f` instead. See
+   [Fish-style keybindings](#fish-style-keybindings).
+3. **Doom Emacs users** — see the [Doom Emacs](#doom-emacs) installation section
+   for a workaround using a custom Evil insert-state binding.
+
+### Can I use `copilot-complete` without enabling `copilot-mode`?
+
+Yes. You can call `M-x copilot-complete` manually in any buffer — it will start
+the server and open the document automatically. Use `copilot-clear-overlay` (or
+simply type) to dismiss the suggestion. This is useful if you prefer on-demand
+completions rather than automatic ones.
+
+### Completions are slow or not appearing
+
+A few things to try:
+
+1. **Run `M-x copilot-diagnose`** — it restarts the server and prints diagnostic
+   info. Look for `NotAuthorized` (subscription issue) or connection errors.
+2. **Check your network** — the language server needs to reach GitHub's API.  If
+   you're behind a proxy, configure `copilot-network-proxy`.
+3. **Large files** — buffers over `copilot-max-char` characters (default 100 000)
+   are skipped. You can raise the limit, but very large files will always be
+   slower.
+4. **Tune `copilot-idle-delay`** — the default is `0` (immediate). A small delay
+   (e.g. `0.2`) reduces server load when typing quickly.
+
+### How do I disable Copilot in certain modes or buffers?
+
+Use `copilot-disable-predicates` to add functions that return `t` when Copilot
+should stay quiet:
+
+```elisp
+;; Disable in org-mode
+(add-to-list 'copilot-disable-predicates
+             (lambda () (derived-mode-p 'org-mode)))
+```
+
+Or simply don't add `copilot-mode` to the hooks of modes you want to exclude.
+If you use `global-copilot-mode`, the predicate approach is the way to go.
+
+### Parentheses are unbalanced in Lisp completions
+
+Copilot.el includes a parentheses balancer that post-processes completions in
+Lisp modes (`emacs-lisp-mode`, `clojure-mode`, `scheme-mode`, etc.) to fix
+unbalanced delimiters. It is enabled by default. If you still see issues,
+make sure `copilot-enable-parentheses-balancer` is `t`, or file a bug report
+with the completion text and buffer context.
+
+If the balancer is causing problems for your workflow, you can disable it:
+
+```elisp
+(setopt copilot-enable-parentheses-balancer nil)
+```
+
+### How do I select a different completion model?
+
+Run `M-x copilot-select-completion-model` to interactively choose from the
+models available on your subscription. The selection is saved in
+`copilot-completion-model`. Set it to `nil` to revert to the server default.
+
 ## Reporting Bugs
 
 - Make sure you have restarted your Emacs (and rebuild the plugin if necessary) after updating the plugin.
-- Please enable event logging by customize `copilot-log-max` (to e.g. 1000) and enable debug log `(setq copilot-server-args '("--stdio" "--debug"))`, then paste related logs in the `*copilot events*`, `*copilot stderr*` and `*copilot-language-server-log*` buffer.
+- Async request errors (e.g. cancelled completions) are logged to `*Messages*` automatically. Check there first for clues.
+- For deeper investigation, enable event logging by customizing `copilot-log-max` (to e.g. 1000) and enable debug log `(setq copilot-server-args '("--stdio" "--debug"))`, then paste related logs from the `*copilot events*`, `*copilot stderr*` and `*copilot-language-server-log*` buffers.
 - If an exception is thrown, please also paste the stack trace (use `M-x toggle-debug-on-error` to enable stack trace).
 
 ## Development
+
+See [doc/design.md](doc/design.md) for an overview of the architecture and key design decisions.
 
 ### Running Tests
 
@@ -486,30 +635,45 @@ There's a manual integration test in `dev/integration-smoke.el` that connects to
 emacs --batch -L . -l dev/integration-smoke.el
 ```
 
+## History
+
+copilot.el was started in March 2022. At the time there was no public Copilot
+server package — the only way to get one was to extract the Node.js agent
+bundled inside [copilot.vim][]. Early versions of copilot.el reverse-engineered
+the agent's JSON-RPC protocol from copilot.vim and shipped a copy of that agent
+in the repository, updating it whenever a new copilot.vim release appeared.
+
+In early 2025, GitHub published the official
+[@github/copilot-language-server][] on npm. copilot.el migrated to this open
+server, dropping the copilot.vim dependency entirely. The switch also enabled
+newer protocol features like `textDocument/inlineCompletion` (replacing the
+legacy `getCompletions`), Copilot Chat, and Next Edit Suggestions.
+
 ## Thanks
 
-These projects helped me a lot:
+These projects helped make copilot.el possible:
 
-- <https://github.com/TommyX12/company-tabnine/>
+- [copilot.vim][] — the original reference implementation whose bundled agent powered copilot.el for its first three years
+- <https://github.com/TommyX12/company-tabnine/> — inspiration for the overlay-based completion UX
 - <https://github.com/cryptobadger/flight-attendant.el>
-- <https://github.com/github/copilot.vim>
 - [@github/copilot-language-server][]
-
-## Do you want to chat with GitHub Copilot?
-
-Just like the copilot plugin for Intellij or VS Code?
-
-Please take a look at [copilot-chat.el](https://github.com/chep/copilot-chat.el)
-
-> [!NOTE]
->
-> It's possible that chat functionality will be added to `copilot.el` as well down the road. PRs welcome!
 
 ## Team
 
-Current maintainer(s): [@bbatsov][], [@emil-vdw][], [@jcs090218][], [@rakotomandimby][].
+Current maintainer: [@bbatsov][].
 
-Retired maintainer: [@zerolfx][].
+Retired maintainers: [@zerolfx][], [@emil-vdw][], [@jcs090218][], [@rakotomandimby][].
+
+## Supporting the Development
+
+`copilot.el` is built and maintained by volunteers in their spare time. If you find it useful,
+please consider supporting its continued development.
+
+Here are the ways in which you can support the project:
+
+- [GitHub Sponsors](https://github.com/sponsors/bbatsov) (recurring or one-time donations)
+- [Patreon](https://www.patreon.com/bbatsov) (recurring donations)
+- [PayPal](https://www.paypal.me/bbatsov) (one-time donations)
 
 ## License
 
@@ -527,4 +691,5 @@ Copyright © 2022-2026 copilot-emacs maintainers and
 [@zerolfx]: https://github.com/zerolfx
 
 [GitHub Copilot]: https://github.com/features/copilot
+[copilot.vim]: https://github.com/github/copilot.vim
 [@github/copilot-language-server]: https://www.npmjs.com/package/@github/copilot-language-server
