@@ -52,6 +52,16 @@ When nil, the server picks the default model."
   :group 'copilot-chat
   :package-version '(copilot . "0.5"))
 
+(defface copilot-chat-error-face
+  '((t :inherit error))
+  "Face for error messages in the chat buffer."
+  :group 'copilot-chat)
+
+(defface copilot-chat-follow-up-face
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Face for follow-up suggestions in the chat buffer."
+  :group 'copilot-chat)
+
 ;;
 ;; Buffer-local state (in *copilot-chat* buffer)
 ;;
@@ -66,13 +76,18 @@ When nil, the server picks the default model."
   "Token for routing `$/progress' notifications.")
 
 (defvar-local copilot-chat--streaming-p nil
-  "Non-nil while a response is being streamed.")
+  "Non-nil while a response is being streamed.
+This is set when the first progress `begin' notification arrives,
+which may be slightly after `copilot-chat--request-id' is set.")
 
 (defvar-local copilot-chat--source-buffer nil
   "The code buffer providing context for this chat.")
 
 (defvar-local copilot-chat--follow-up nil
   "Follow-up suggestion from the last turn.")
+
+(defvar-local copilot-chat--request-id nil
+  "ID of the in-flight async request, used for cancellation.")
 
 ;;
 ;; Global state
@@ -89,8 +104,49 @@ When nil, the server picks the default model."
   "Name of the Copilot Chat buffer.")
 
 ;;
+;; Internal helpers
+;;
+
+(defun copilot-chat--remove-active-tokens (buf)
+  "Remove all active-buffer entries for BUF."
+  (setq copilot-chat--active-buffers
+        (cl-remove-if (lambda (entry) (eq (cdr entry) buf))
+                      copilot-chat--active-buffers)))
+
+(defun copilot-chat--end-streaming ()
+  "Reset streaming state in the current chat buffer."
+  (setq copilot-chat--streaming-p nil)
+  (setq copilot-chat--request-id nil)
+  (force-mode-line-update))
+
+(defun copilot-chat--handle-request-error (err label)
+  "Handle error ERR from a chat request identified by LABEL.
+Resets streaming state, displays the error in the chat buffer,
+and cleans up active tokens."
+  (copilot--log 'error "Chat %s failed: %S" label err)
+  (when-let* ((buf (get-buffer copilot-chat--buffer-name)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (copilot-chat--end-streaming)
+        (copilot-chat--remove-active-tokens buf))))
+  (copilot-chat--insert-error (format "%s" err)))
+
+;;
 ;; Progress notification handler
 ;;
+
+(defun copilot-chat--extract-reply (value)
+  "Extract the reply text from a progress report VALUE.
+The server may provide the reply directly as `:reply' (older format)
+or nested inside `:editAgentRounds' (newer format).
+Returns a string or nil."
+  (let ((reply (or (plist-get value :reply)
+                   (when-let* ((rounds (plist-get value :editAgentRounds))
+                               ((vectorp rounds))
+                               ((> (length rounds) 0))
+                               (last-round (aref rounds (1- (length rounds)))))
+                     (plist-get last-round :reply)))))
+    (and (stringp reply) reply)))
 
 (defun copilot-chat--handle-progress (msg)
   "Handle `$/progress' notification MSG for chat streaming."
@@ -102,20 +158,28 @@ When nil, the server picks the default model."
           (let ((kind (plist-get value :kind)))
             (cond
              ((equal kind "begin")
-              (setq copilot-chat--streaming-p t))
+              (setq copilot-chat--streaming-p t)
+              (force-mode-line-update))
              ((equal kind "report")
-              (when-let* ((reply (plist-get value :reply)))
+              (when-let* ((reply (copilot-chat--extract-reply value)))
                 (let ((inhibit-read-only t))
                   (goto-char (point-max))
                   (insert reply))
                 (copilot-chat--scroll-to-bottom)))
              ((equal kind "end")
-              (setq copilot-chat--streaming-p nil)
-              (when-let* ((result (plist-get value :result)))
+              (copilot-chat--end-streaming)
+              (when-let* ((result (plist-get value :result))
+                          ((listp result)))
                 (setq copilot-chat--follow-up (plist-get result :followUp)))
               (let ((inhibit-read-only t))
                 (goto-char (point-max))
-                (insert "\n\n"))
+                (insert "\n\n")
+                (when (and copilot-chat--follow-up
+                           (stringp copilot-chat--follow-up)
+                           (not (string-empty-p copilot-chat--follow-up)))
+                  (insert (propertize
+                           (format "Follow-up: %s\n\n" copilot-chat--follow-up)
+                           'face 'copilot-chat-follow-up-face))))
               (copilot-chat--scroll-to-bottom)
               (setq copilot-chat--active-buffers
                     (assoc-delete-all token copilot-chat--active-buffers))))))))))
@@ -143,13 +207,22 @@ Return editor context for the requested skill."
 
 (defun copilot-chat--generate-context-doc ()
   "Generate context document from the source buffer."
-  (let ((buf (and (boundp 'copilot-chat--source-buffer)
-                  copilot-chat--source-buffer)))
+  (let ((buf copilot-chat--source-buffer))
     (when (and buf (buffer-live-p buf))
       (with-current-buffer buf
         (let ((doc (copilot--generate-doc)))
           (plist-put doc :source (copilot--get-source))
           doc)))))
+
+(defun copilot-chat--insert-error (error-msg)
+  "Insert ERROR-MSG into the chat buffer with error styling."
+  (when-let* ((buf (get-buffer copilot-chat--buffer-name)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (propertize (format "\n[Error: %s]\n\n" error-msg)
+                            'face 'copilot-chat-error-face))
+        (copilot-chat--scroll-to-bottom)))))
 
 ;;
 ;; Protocol methods
@@ -162,24 +235,31 @@ CALLBACK is called with the response containing conversationId and turnId."
     (with-current-buffer (get-buffer copilot-chat--buffer-name)
       (setq copilot-chat--work-done-token token)
       (push (cons token (current-buffer)) copilot-chat--active-buffers))
-    (copilot--async-request
-     'conversation/create
-     (append
-      (list :workDoneToken token
-            :turns (vector
-                    (list :request message
-                          :response ""
-                          :turnId ""))
-            :capabilities (list :skills (vector "current-editor")
-                                :allSkills t)
-            :source "panel")
-      (when copilot-chat-model
-        (list :model copilot-chat-model)))
-     :success-fn callback
-     :error-fn (lambda (err)
-                 (copilot--log 'error "Chat create failed: %S" err)
-                 (with-current-buffer (get-buffer copilot-chat--buffer-name)
-                   (setq copilot-chat--streaming-p nil))))))
+    (let ((req-id
+           (copilot--async-request
+            'conversation/create
+            (append
+             (list :workDoneToken token
+                   :turns (vector
+                           (list :request message
+                                 :response ""
+                                 :turnId ""))
+                   :capabilities (list :skills (vector "current-editor")
+                                       :allSkills t)
+                   :source "panel")
+             (when copilot-chat-model
+               (list :model copilot-chat-model))
+             (list :workspaceFolders
+                   (vconcat
+                    (when-let* ((root (copilot--workspace-root)))
+                      (list (list :uri (concat "file://" root)
+                                  :name (file-name-nondirectory
+                                         (directory-file-name root))))))))
+            :success-fn callback
+            :error-fn (lambda (err)
+                        (copilot-chat--handle-request-error err "create")))))
+      (with-current-buffer (get-buffer copilot-chat--buffer-name)
+        (setq copilot-chat--request-id req-id)))))
 
 (defun copilot-chat--send-turn (message)
   "Send a follow-up MESSAGE in the current conversation."
@@ -190,24 +270,22 @@ CALLBACK is called with the response containing conversationId and turnId."
       (push (cons token chat-buf) copilot-chat--active-buffers)
       (let ((conv-id copilot-chat--conversation-id)
             (doc (copilot-chat--generate-context-doc)))
-        (copilot--async-request
-         'conversation/turn
-         (append
-          (list :workDoneToken token
-                :conversationId conv-id
-                :message message
-                :source "panel")
-          (when doc (list :doc doc)))
-         :success-fn (lambda (result)
-                       (when (buffer-live-p chat-buf)
-                         (with-current-buffer chat-buf
-                           (setq copilot-chat--current-turn-id
-                                 (plist-get result :turnId)))))
-         :error-fn (lambda (err)
-                     (copilot--log 'error "Chat turn failed: %S" err)
-                     (when (buffer-live-p chat-buf)
-                       (with-current-buffer chat-buf
-                         (setq copilot-chat--streaming-p nil)))))))))
+        (setq copilot-chat--request-id
+              (copilot--async-request
+               'conversation/turn
+               (append
+                (list :workDoneToken token
+                      :conversationId conv-id
+                      :message message
+                      :source "panel")
+                (when doc (list :doc doc)))
+               :success-fn (lambda (result)
+                             (when (buffer-live-p chat-buf)
+                               (with-current-buffer chat-buf
+                                 (setq copilot-chat--current-turn-id
+                                       (plist-get result :turnId)))))
+               :error-fn (lambda (err)
+                           (copilot-chat--handle-request-error err "turn"))))))))
 
 (defun copilot-chat--destroy ()
   "Destroy the current conversation."
@@ -221,12 +299,9 @@ CALLBACK is called with the response containing conversationId and turnId."
              (list :conversationId copilot-chat--conversation-id)))
           (setq copilot-chat--conversation-id nil)
           (setq copilot-chat--current-turn-id nil)
-          (setq copilot-chat--streaming-p nil)
           (setq copilot-chat--follow-up nil)
-          ;; Clean up any active tokens for this buffer
-          (setq copilot-chat--active-buffers
-                (cl-remove-if (lambda (entry) (eq (cdr entry) chat-buf))
-                              copilot-chat--active-buffers)))))))
+          (copilot-chat--end-streaming)
+          (copilot-chat--remove-active-tokens chat-buf))))))
 
 ;;
 ;; UI helpers
@@ -255,26 +330,47 @@ CALLBACK is called with the response containing conversationId and turnId."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c RET") #'copilot-chat-send)
     (define-key map (kbd "C-c C-c") #'copilot-chat-send)
-    (define-key map (kbd "C-c C-k") #'copilot-chat-reset)
+    (define-key map (kbd "C-c C-k") #'copilot-chat-stop)
+    (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for `copilot-chat-mode'.")
 
 (defconst copilot-chat--font-lock-keywords
   `(("^\\(You:\\)" 1 'bold)
-    ("^\\(Copilot:\\)" 1 'bold)
-    ("^\\(##+ .*\\)" 1 'font-lock-keyword-face)
-    ("`\\([^`\n]+\\)`" 1 'font-lock-constant-face)
-    ("\\*\\*\\([^*\n]+\\)\\*\\*" 1 'bold)
-    ("^```.*$" 0 'font-lock-comment-face))
-  "Font-lock keywords for `copilot-chat-mode'.")
+    ("^\\(Copilot:\\)" 1 'bold))
+  "Extra font-lock keywords added on top of the parent mode's highlighting.")
+
+(defun copilot-chat--mode-line ()
+  "Return the mode-line lighter for `copilot-chat-mode'."
+  (if copilot-chat--streaming-p
+      " Copilot-Chat[Streaming]"
+    " Copilot-Chat"))
+
+(declare-function gfm-mode "ext:markdown-mode" ())
+
+(defun copilot-chat--setup-mode ()
+  "Set up font-lock, mode-line, and visual-line for `copilot-chat-mode'.
+When `markdown-mode' is available, enable GFM font-lock for full
+markdown rendering; otherwise use basic highlighting."
+  (when (require 'markdown-mode nil t)
+    (setq-local markdown-fontify-code-blocks-natively t)
+    (setq-local font-lock-defaults
+                (with-temp-buffer
+                  (gfm-mode)
+                  font-lock-defaults))
+    (font-lock-flush))
+  (font-lock-add-keywords nil copilot-chat--font-lock-keywords t)
+  (setq mode-name '(:eval (copilot-chat--mode-line)))
+  (visual-line-mode 1)
+  (setq word-wrap t))
 
 (define-derived-mode copilot-chat-mode special-mode "Copilot-Chat"
   "Major mode for Copilot Chat.
+When `markdown-mode' is installed, the buffer gets full GFM
+rendering; otherwise basic font-lock is used.
 
 \\{copilot-chat-mode-map}"
-  (setq-local font-lock-defaults '(copilot-chat--font-lock-keywords t))
-  (visual-line-mode 1)
-  (setq word-wrap t))
+  (copilot-chat--setup-mode))
 
 ;;
 ;; Interactive commands
@@ -356,6 +452,24 @@ When called interactively, prompt for the message."
     (copilot-chat message)))
 
 ;;;###autoload
+(defun copilot-chat-stop ()
+  "Cancel the in-flight request and stop streaming.
+If not currently streaming, reset the conversation instead."
+  (interactive)
+  (let ((chat-buf (get-buffer copilot-chat--buffer-name)))
+    (if (and chat-buf
+             (buffer-local-value 'copilot-chat--streaming-p chat-buf))
+        (with-current-buffer chat-buf
+          (when (and copilot-chat--request-id (copilot--connection-alivep))
+            (jsonrpc-notify copilot--connection
+                            '$/cancelRequest
+                            (list :id copilot-chat--request-id)))
+          (copilot-chat--end-streaming)
+          (copilot-chat--insert-error "Cancelled")
+          (copilot-chat--remove-active-tokens chat-buf))
+      (copilot-chat-reset))))
+
+;;;###autoload
 (defun copilot-chat-reset ()
   "Destroy the current conversation and clear the chat buffer."
   (interactive)
@@ -364,6 +478,23 @@ When called interactively, prompt for the message."
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)))))
+
+(defun copilot-chat-select-model ()
+  "Interactively select a Copilot Chat model."
+  (interactive)
+  (let* ((models (copilot--request 'copilot/models nil))
+         (chat-models
+          (seq-filter (lambda (m)
+                        (seq-contains-p (plist-get m :scopes) "chat-panel"))
+                      models))
+         (choices (mapcar (lambda (m)
+                            (cons (format "%s (%s)" (plist-get m :modelName) (plist-get m :id))
+                                  (plist-get m :id)))
+                          chat-models))
+         (choice (completing-read "Chat model: " choices nil t))
+         (model-id (cdr (assoc choice choices))))
+    (setq copilot-chat-model model-id)
+    (message "Chat model set to %s" model-id)))
 
 (provide 'copilot-chat)
 ;;; copilot-chat.el ends here

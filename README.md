@@ -229,10 +229,15 @@ M-x copilot-chat-send-region
 
 Key bindings in the `*copilot-chat*` buffer:
 - **C-c RET** or **C-c C-c** — send a follow-up message
-- **C-c C-k** — reset the conversation
+- **C-c C-k** — cancel streaming, or reset if idle
+- **q** — quit the chat window
 
 Customization:
 - **`copilot-chat-model`** — model to use for chat (default `nil`, meaning server default)
+
+> [!TIP]
+>
+> Install [`markdown-mode`](https://github.com/jrblevin/markdown-mode) for rich markdown rendering (headings, code blocks, emphasis, etc.) in the chat buffer. Without it, only basic highlighting is used.
 
 For a more feature-rich chat experience, take a look at [copilot-chat.el](https://github.com/chep/copilot-chat.el).
 
@@ -402,6 +407,7 @@ For example:
 | `copilot-logout` | Log out from GitHub Copilot |
 | `copilot-diagnose` | Restart the server and show diagnostic info |
 | `copilot-select-completion-model` | Choose which model to use for completions |
+| `copilot-chat-select-model` | Choose which model to use for chat |
 | **Completion** | |
 | `copilot-mode` | Toggle automatic completions in the current buffer |
 | `copilot-complete` | Trigger a completion at point |
@@ -421,6 +427,7 @@ For example:
 | `copilot-chat` | Open Copilot Chat and send a message |
 | `copilot-chat-send` | Send a follow-up message in the current chat |
 | `copilot-chat-send-region` | Send the selected region as context with an optional prompt |
+| `copilot-chat-stop` | Cancel streaming, or reset the conversation if idle |
 | `copilot-chat-reset` | Destroy the current conversation and clear the chat buffer |
 | **Next Edit Suggestions** | |
 | `copilot-nes-mode` | Toggle NES in the current buffer |
@@ -600,6 +607,16 @@ If the balancer is causing problems for your workflow, you can disable it:
 Run `M-x copilot-select-completion-model` to interactively choose from the
 models available on your subscription. The selection is saved in
 `copilot-completion-model`. Set it to `nil` to revert to the server default.
+
+**Note:** Only models with a "completion" scope are available for inline
+completions. Models like Claude, Gemini, and others that you may see in VS
+Code's chat UI are chat/edit-only and cannot be used for inline completions.
+This is a server-side limitation, not a copilot.el restriction. Currently
+GitHub only offers a single completion model (`gpt-41-copilot`).
+
+To select a chat model, run `M-x copilot-chat-select-model`. Many more models
+are available for chat (Claude, Gemini, GPT-4o, etc.). The selection is saved
+in `copilot-chat-model`.
 
 ## Reporting Bugs
 

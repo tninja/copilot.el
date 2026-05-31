@@ -6,7 +6,7 @@
 ;; Maintainer: Bozhidar Batsov <bozhidar@batsov.dev>
 ;; URL: https://github.com/copilot-emacs/copilot.el
 ;; Package-Requires: ((emacs "27.2") (editorconfig "0.8.2") (jsonrpc "1.0.14") (compat "30") (track-changes "1.4"))
-;; Version: 0.4.0
+;; Version: 0.5.0
 ;; Keywords: convenience copilot
 
 ;; The MIT License (MIT)
@@ -286,8 +286,8 @@ recently updated session."
             (message (plist-get latest :message))
             (percentage (plist-get latest :percentage)))
         (cond
-         (message (format " [%s: %s]" title message))
-         (percentage (format " [%s: %d%%]" title percentage))
+         ((stringp message) (format " [%s: %s]" title message))
+         ((numberp percentage) (format " [%s: %d%%]" title percentage))
          (t (format " [%s]" title)))))))
 
 (defun copilot--status-lighter ()
@@ -693,13 +693,19 @@ on success, or an error/timeout message on failure."
          (choices (mapcar (lambda (m)
                             (cons (format "%s (%s)" (plist-get m :modelName) (plist-get m :id))
                                   (plist-get m :id)))
-                          completion-models))
-         (choice (completing-read "Completion model: " choices nil t))
-         (model-id (cdr (assoc choice choices))))
-    (setq copilot-completion-model model-id)
-    (copilot--notify 'workspace/didChangeConfiguration
-                     `(:settings ,(copilot--effective-lsp-settings)))
-    (copilot--log 'info "Completion model set to %s" model-id)))
+                          completion-models)))
+    (if (= (length choices) 1)
+        (let ((model-id (cdar choices)))
+          (setq copilot-completion-model model-id)
+          (copilot--notify 'workspace/didChangeConfiguration
+                           `(:settings ,(copilot--effective-lsp-settings)))
+          (message "Only one completion model available: %s" model-id))
+      (let* ((choice (completing-read "Completion model: " choices nil t))
+             (model-id (cdr (assoc choice choices))))
+        (setq copilot-completion-model model-id)
+        (copilot--notify 'workspace/didChangeConfiguration
+                         `(:settings ,(copilot--effective-lsp-settings)))
+        (copilot--log 'info "Completion model set to %s" model-id)))))
 
 ;;
 ;; Auto completion
@@ -923,17 +929,18 @@ POS defaults to point.  Character offset is in UTF-16 code units."
   "Generate doc parameters for completion request."
   (save-restriction
     (widen)
-    (list :version copilot--doc-version
-          :tabSize (copilot--infer-indentation-offset)
-          ;; indentSize doesn't not appear to be used, but has been in this code
-          ;; base from the start. For now leave it as is.
-          :indentSize (copilot--infer-indentation-offset)
-          :insertSpaces (if indent-tabs-mode :json-false t)
-          :path (buffer-file-name)
-          :uri (copilot--get-uri)
-          :relativePath (copilot--get-relative-path)
-          :languageId (copilot--get-language-id)
-          :position (copilot--lsp-pos))))
+    (let ((indent (copilot--infer-indentation-offset)))
+      (list :version copilot--doc-version
+            :tabSize indent
+            ;; indentSize doesn't not appear to be used, but has been in this code
+            ;; base from the start. For now leave it as is.
+            :indentSize indent
+            :insertSpaces (if indent-tabs-mode :json-false t)
+            :path (buffer-file-name)
+            :uri (copilot--get-uri)
+            :relativePath (copilot--get-relative-path)
+            :languageId (copilot--get-language-id)
+            :position (copilot--lsp-pos)))))
 
 (defun copilot--inline-completion-params (trigger-kind)
   "Build parameters for textDocument/inlineCompletion.
@@ -962,7 +969,11 @@ TRIGGER-KIND is 1 for invoked, 2 for automatic (default)."
   (setq copilot--completion-request-id
         (copilot--async-request 'textDocument/inlineCompletion
                                 (copilot--inline-completion-params (or trigger-kind 2))
-                                :success-fn callback)))
+                                :success-fn callback
+                                :error-fn (lambda (err)
+                                            (unless (= (plist-get err :code) -32800) ; Request canceled
+                                              (copilot--log 'error "textDocument/inlineCompletion failed: %S"
+                                                            err))))))
 
 (defun copilot--cycle-completion (direction)
   "Cycle completion with DIRECTION."
@@ -1071,14 +1082,14 @@ Each request METHOD can have only one HANDLER."
  'didChangeStatus
  (lambda (msg)
    (copilot--dbind (kind busy message) msg
-     (setq copilot--status (list :kind kind :busy busy :message message))
+     (setq copilot--status (list :kind kind :busy (eq busy t) :message message))
      (force-mode-line-update t))))
 
 (copilot-on-request
  'window/showMessageRequest
  (lambda (msg)
    (copilot--dbind (type message actions) msg
-     (if actions
+     (if (and actions (vectorp actions) (> (length actions) 0))
          (let* ((titles (mapcar (lambda (a) (plist-get a :title))
                                 (append actions nil)))
                 (chosen (completing-read
@@ -1098,7 +1109,7 @@ Each request METHOD can have only one HANDLER."
        (copilot--dbind (uri external takeFocus) msg
          (let ((focus (not (eq takeFocus :json-false))))
            (cond
-            ((or external (string-match-p "\\`https?://" uri))
+            ((or (eq external t) (string-match-p "\\`https?://" uri))
              (browse-url uri))
             ((string-prefix-p "file://" uri)
              (let* ((path (url-unhex-string
@@ -1557,14 +1568,14 @@ Copilot will show completions only if all predicates return t."
   :group 'copilot
   :package-version '(copilot . "0.1"))
 
-(defmacro copilot--satisfy-predicates (enable disable)
-  "Return t if satisfy all predicates in ENABLE and none in DISABLE."
-  `(and (cl-every (lambda (pred)
-                    (if (functionp pred) (funcall pred) t))
-                  ,enable)
-        (cl-notany (lambda (pred)
-                     (if (functionp pred) (funcall pred) nil))
-                   ,disable)))
+(defun copilot--satisfy-predicates (enable disable)
+  "Return t if all predicates in ENABLE return t and none in DISABLE do."
+  (and (cl-every (lambda (pred)
+                   (if (functionp pred) (funcall pred) t))
+                 enable)
+       (cl-notany (lambda (pred)
+                    (if (functionp pred) (funcall pred) nil))
+                  disable)))
 
 (defun copilot--pre-command ()
   "Handle `pre-command-hook' for Copilot.
@@ -1664,6 +1675,7 @@ Use this for custom bindings in `copilot-mode'.")
     ["Toggle NES Mode" copilot-nes-mode]
     "--"
     ["Select Completion Model" copilot-select-completion-model]
+    ["Select Chat Model" copilot-chat-select-model]
     ["Login" copilot-login]
     ["Logout" copilot-logout]
     "--"

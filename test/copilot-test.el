@@ -669,7 +669,15 @@
           (expect (plist-get copilot--status :kind) :to-equal "Warning")
           (expect (plist-get copilot--status :busy) :to-equal nil)
           (expect (plist-get copilot--status :message) :to-equal "something")
-          (expect 'force-mode-line-update :to-have-been-called-with t)))))
+          (expect 'force-mode-line-update :to-have-been-called-with t))))
+
+    (it "normalizes :json-false to nil for busy flag"
+      (let ((copilot--status nil))
+        (spy-on 'force-mode-line-update)
+        (let ((handlers (gethash 'didChangeStatus copilot--notification-handlers)))
+          (funcall (car handlers)
+                   '(:kind "Normal" :busy :json-false :message nil))
+          (expect (plist-get copilot--status :busy) :to-equal nil)))))
 
   ;;
   ;; window/showMessageRequest handler
@@ -751,6 +759,23 @@
                                       (list :uri uri :takeFocus :json-false))))
                 (expect 'display-buffer :to-have-been-called)
                 (expect 'find-file-noselect :to-have-been-called)
+                (expect (plist-get result :success) :to-equal t)))
+          (delete-file temp-file))))
+
+    (it "does not treat external :json-false as external"
+      (let ((temp-file (make-temp-file "copilot-showdoc")))
+        (unwind-protect
+            (progn
+              (spy-on 'browse-url)
+              (spy-on 'find-file)
+              (let* ((handler (gethash 'window/showDocument
+                                        copilot--request-handlers))
+                     (uri (concat "file://" temp-file))
+                     (result (funcall handler
+                                      (list :uri uri :external :json-false
+                                            :takeFocus t))))
+                (expect 'browse-url :not :to-have-been-called)
+                (expect 'find-file :to-have-been-called)
                 (expect (plist-get result :success) :to-equal t)))
           (delete-file temp-file))))
 
